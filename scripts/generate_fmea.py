@@ -31,11 +31,20 @@ PFMEA/DFMEA 报告生成器
     - 严禁使用 RPN（=S×O×D），2019 版已废弃
 """
 
+# ===== Windows 编码修复（必须在最前面） =====
+# Windows 服务器默认 stdout 编码是 GBK/CP936，会导致中文输出乱码
+# 强制设置为 UTF-8，确保 subprocess 调用时能正确解析中文输出
+import sys
+import io
+if hasattr(sys.stdout, 'buffer'):
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace', line_buffering=True)
+if hasattr(sys.stderr, 'buffer'):
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace', line_buffering=True)
+
 import argparse
 import json
 import os
 import subprocess
-import sys
 import datetime
 from pathlib import Path
 
@@ -1249,7 +1258,18 @@ def set_page_header(doc, fmea_no):
 
 
 def create_docx_report(data: dict, output_path: Path):
-    """生成 FMEA Word 报告（7 章）。"""
+    """生成 FMEA Word 报告（纯表格版本，与 xlsx 7 Sheet 内容完全一致）。
+
+    用户要求：docx 和 xlsx 都应该是表格内容，内容应该是一样的。
+    因此 docx 不再是"七步法报告"（段落+表格混合），而是 7 个表格（对应 xlsx 的 7 个 Sheet）：
+    - 表 1：表头信息（项目信息表）
+    - 表 2：结构分析表
+    - 表 3：功能分析表
+    - 表 4：失效分析表（FE→FM→FC）
+    - 表 5：风险分析表（S/O/D + AP + CC/SC）
+    - 表 6：优化措施表
+    - 表 7：风险矩阵表 + 风险统计表
+    """
     doc = Document()
     set_doc_default_font(doc)
 
@@ -1257,88 +1277,62 @@ def create_docx_report(data: dict, output_path: Path):
     fmea_no = data.get("fmea_no", f"FMEA-{datetime.date.today().strftime('%Y%m%d')}-001")
     set_page_header(doc, fmea_no)
 
-    # 标题
+    # 文档标题
     title = doc.add_heading(level=0)
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    run = title.add_run(f"{fmea_type} 分析报告")
+    run = title.add_run(f"{fmea_type} 分析表")
     set_run_font(run, size=22, bold=True, color=HEADER_FILL)
 
-    # 副标题
     sub = doc.add_paragraph()
     sub.alignment = WD_ALIGN_PARAGRAPH.CENTER
     run = sub.add_run(
-        f"产品：{data.get('product_name', '')}\n"
-        f"客户：{data.get('customer', '')}\n"
-        f"日期：{datetime.date.today().isoformat()}"
+        f"产品：{data.get('product_name', '')}    客户：{data.get('customer', '')}    日期：{datetime.date.today().isoformat()}"
     )
     set_run_font(run, size=11)
 
-    doc.add_paragraph()
-
     chains = data.get("failure_chains", [])
 
-    # ---------- 第 1 章：概述 ----------
-    add_heading(doc, "第一章 概述", level=1)
-
-    add_paragraph(doc,
-        f"本报告基于 AIAG & VDA FMEA 手册（2019 版）七步法编制，覆盖"
-        f"{fmea_type} 分析的全过程。分析对象为"
-        f"{data.get('product_name', '')}，涉及客户 {data.get('customer', '')}。"
-    )
-
-    add_paragraph(doc, "项目基本信息：", bold=True)
-
-    info_items = [
-        ("FMEA 类型", fmea_type),
-        ("产品名称", data.get("product_name", "")),
-        ("客户名称", data.get("customer", "")),
-        ("项目编号", data.get("project_no", "（待填写）")),
+    # ===== 表 1：表头信息（对应 xlsx Sheet 1） =====
+    add_heading(doc, "表 1  表头信息", level=1)
+    header_info = [
+        ("FMEA 类型", data.get("fmea_type", "")),
+        ("公司名称", data.get("company", "")),
+        ("顾客名称", data.get("customer", "")),
+        ("项目名称", data.get("product_name", "")),
+        ("项目编号", data.get("project_no", "")),
         ("系统层级", data.get("system_level", "—")),
+        ("设计责任", data.get("design_responsibility", "—")),
         ("工艺名称", data.get("process_name", "—")),
-        ("团队成员", data.get("team_members", "（待填写）")),
+        ("制造地址", data.get("manufacturing_site", "")),
+        ("团队成员", data.get("team_members", "")),
+        ("FMEA 开始日期", data.get("start_date", datetime.date.today().isoformat())),
+        ("FMEA 修订日期", datetime.date.today().isoformat()),
         ("FMEA 编号", fmea_no),
-        ("FMEA 编制人", data.get("preparer", "（待填写）")),
-        ("FMEA 审核人", data.get("reviewer", "（待填写）")),
-        ("FMEA 批准人", data.get("approver", "（待填写）")),
+        ("FMEA 编制人", data.get("preparer", "")),
+        ("FMEA 审核人", data.get("reviewer", "")),
+        ("FMEA 批准人", data.get("approver", "")),
+        ("使用模板", data.get("template", "generic-fmea")),
+        ("参考标准", "AIAG & VDA FMEA Handbook 2019"),
     ]
-    add_kv_table(doc, info_items, label_width_cm=4.5, value_width_cm=12)
+    add_kv_table(doc, header_info, label_width_cm=4.5, value_width_cm=12)
 
-    add_paragraph(doc, "")
-    add_paragraph(doc, "参考标准：", bold=True)
-    add_paragraph(doc, "AIAG & VDA FMEA Handbook 2019、IATF 16949:2016", indent=True)
-
-    # ---------- 第 2 章：结构分析 ----------
-    add_heading(doc, "第二章 结构分析", level=1)
-
-    add_paragraph(doc,
-        "结构分析将分析对象分解为可视化的结构，识别系统要素及其相互关系。"
-        "本步骤为后续功能分析和失效分析提供基础。"
-    )
-
+    # ===== 表 2：结构分析（对应 xlsx Sheet 2） =====
+    add_heading(doc, "表 2  结构分析（步骤二）", level=1)
     structure = data.get("structure_tree", [])
     if structure:
-        add_paragraph(doc, "结构树：")
-        for item in structure:
-            indent = "  " * (int(item.get("level_indent", 0)) or 0)
-            add_paragraph(doc, f"{indent}• {item.get('name', '')}：{item.get('description', '')}", indent=True)
+        struct_rows = [
+            [item.get("level", ""), item.get("name", ""), item.get("description", "")]
+            for item in structure
+        ]
+        add_table(doc, ["层级", "要素名称", "说明"], struct_rows,
+                  col_widths_cm=[2.5, 4, 9])
     else:
-        add_paragraph(doc,
-            "（结构分析需在 FMEA 团队会议中填写结构树/过程流程图。"
-            "DFMEA 使用结构树或方块图，PFMEA 使用过程流程图 + 4M1E 工作要素。）",
-            indent=True
-        )
+        add_paragraph(doc, "（请在 FMEA 团队会议中填写结构树/过程流程图。DFMEA 用结构树或方块图，PFMEA 用过程流程图 + 4M1E 工作要素。）", indent=True)
 
-    # ---------- 第 3 章：功能分析 ----------
-    add_heading(doc, "第三章 功能分析", level=1)
-
-    add_paragraph(doc,
-        "功能分析明确每个系统要素/工序的功能及其要求。"
-        "功能的完整定义会使失效分析更全面。功能定义遵循「主动动词 + 可测量名词」的格式。"
-    )
-
+    # ===== 表 3：功能分析（对应 xlsx Sheet 3） =====
+    add_heading(doc, "表 3  功能分析（步骤三）", level=1)
     functions = data.get("function_tree", [])
     if functions:
-        add_paragraph(doc, "功能清单：")
         func_rows = [
             [item.get("level", ""), item.get("name", ""), item.get("function", "")]
             for item in functions
@@ -1346,44 +1340,23 @@ def create_docx_report(data: dict, output_path: Path):
         add_table(doc, ["层级", "要素名称", "功能描述"], func_rows,
                   col_widths_cm=[2.5, 4, 9])
     else:
-        add_paragraph(doc,
-            "（功能分析应在结构分析基础上展开。"
-            "DFMEA 使用功能树或参数图（P-图），PFMEA 使用过程功能分析。）",
-            indent=True
-        )
+        add_paragraph(doc, "（功能定义遵循「主动动词 + 可测量名词」格式。DFMEA 用功能树或参数图 P-图，PFMEA 用过程功能分析。）", indent=True)
 
-    # ---------- 第 4 章：失效分析 ----------
-    add_heading(doc, "第四章 失效分析", level=1)
-
-    add_paragraph(doc,
-        "失效分析识别每个功能的潜在失效影响（FE）、失效模式（FM）和失效起因（FC），"
-        "形成失效链 FE→FM→FC。失效模式包括 7 种类型：功能丧失、功能退化、功能间歇、"
-        "部分功能丧失、非预期功能、功能超范围、功能延迟。"
-    )
-
+    # ===== 表 4：失效分析（对应 xlsx Sheet 4） =====
+    add_heading(doc, "表 4  失效分析（步骤四：失效链 FE→FM→FC）", level=1)
     if chains:
-        add_paragraph(doc, f"共识别 {len(chains)} 条失效链：")
-
         chain_rows = [
             [i, c.get("fe", ""), c.get("fm", ""), c.get("fc", "")]
             for i, c in enumerate(chains, start=1)
         ]
         add_table(doc, ["序号", "失效影响（FE）", "失效模式（FM）", "失效起因（FC）"],
-                  chain_rows, col_widths_cm=[1.5, 5.5, 4.5, 5.5])
+                  chain_rows, col_widths_cm=[1.2, 5, 4, 5])
+    else:
+        add_paragraph(doc, "（无失效链数据）", indent=True)
 
-    # ---------- 第 5 章：风险分析 ----------
-    add_heading(doc, "第五章 风险分析", level=1)
-
-    add_paragraph(doc,
-        "风险分析通过评估严重度（S）、频度（O）、探测度（D）来估计风险，"
-        "并基于 2019 版 AP 行动优先级矩阵判定 H/M/L 三档优先级。"
-        "本步骤不再使用 RPN（=S×O×D），改用 AP 矩阵。"
-    )
-
-    h_count = m_count = l_count = cc_count = sc_count = 0
+    # ===== 表 5：风险分析（对应 xlsx Sheet 5） =====
+    add_heading(doc, "表 5  风险分析（步骤五：S/O/D 评级 + AP + 特殊特性）", level=1)
     if chains:
-        add_paragraph(doc, "风险评级表：")
-
         risk_rows = []
         for i, c in enumerate(chains, start=1):
             s = c.get("s", 5)
@@ -1392,82 +1365,89 @@ def create_docx_report(data: dict, output_path: Path):
             ap = c.get("ap", get_ap_priority(s, o, d))
             sc = get_special_characteristic(s, ap)
             risk_rows.append([
-                i, c.get("fm", ""), s, o, d, ap, sc
+                i,
+                c.get("fe", ""),
+                c.get("fm", ""),
+                c.get("pc", ""),
+                c.get("dc", ""),
+                s, o, d, ap, sc,
             ])
-
-        add_table(doc, ["序号", "失效模式", "S", "O", "D", "AP", "特殊特性"],
+        add_table(doc,
+                  ["序号", "失效影响（FE）", "失效模式（FM）", "预防控制（PC）", "探测控制（DC）",
+                   "S", "O", "D", "AP", "特殊特性"],
                   risk_rows,
-                  col_widths_cm=[1.5, 5, 1.2, 1.2, 1.2, 1.5, 2],
-                  ap_col=6, special_char_col=7)
+                  col_widths_cm=[1, 3.5, 2.5, 2.5, 2.5, 0.8, 0.8, 0.8, 1, 1.5],
+                  ap_col=9, special_char_col=10)
 
-        # 风险统计
-        add_paragraph(doc, "")
-        add_paragraph(doc, "风险统计：", bold=True)
-
-        h_count = sum(1 for c in chains if c.get("ap") == "H")
-        m_count = sum(1 for c in chains if c.get("ap") == "M")
-        l_count = sum(1 for c in chains if c.get("ap") == "L")
-        cc_count = sum(1 for c in chains if c.get("s", 0) >= 9)
-        sc_count = sum(1 for c in chains if c.get("s", 0) == 8 and c.get("ap") in ("H", "M"))
-
-        stats = [
-            f"失效链总数：{len(chains)}",
-            f"AP=H（高优先级）：{h_count} 项",
-            f"AP=M（中优先级）：{m_count} 项",
-            f"AP=L（低优先级）：{l_count} 项",
-            f"CC（关键特性，S≥9）：{cc_count} 项",
-            f"SC（特殊特性，S=8 且 AP=H/M）：{sc_count} 项",
-        ]
-        for s in stats:
-            add_paragraph(doc, f"• {s}", indent=True)
-
-    # ---------- 第 6 章：优化措施 ----------
-    add_heading(doc, "第六章 优化措施", level=1)
-
-    add_paragraph(doc,
-        "优化措施分为三类：预防控制（PC）改进、探测控制（DC）改进、设计/过程变更。"
-        "对于 S=9-10 且 AP=H/M 的失效影响，建议至少由管理层评审。"
-    )
-
+    # ===== 表 6：优化措施（对应 xlsx Sheet 6） =====
+    add_heading(doc, "表 6  优化措施（步骤六：PC/DC 改进 + 措施跟踪）", level=1)
     measures = data.get("optimization_measures", [])
     if measures:
-        add_paragraph(doc, f"共 {len(measures)} 项优化措施：")
-
         measure_rows = []
         for i, m in enumerate(measures, start=1):
             measure_rows.append([
                 i,
+                m.get("fm", ""),
                 m.get("type", "PC+DC 改进"),
                 m.get("description", ""),
-                m.get("owner", "（待指定）"),
-                m.get("due_date", "（待指定）"),
+                m.get("owner", ""),
+                m.get("due_date", ""),
                 m.get("status", "已建议"),
+                "—",  # 措施后 S
+                "—",  # 措施后 O
+                "—",  # 措施后 D
+                "—",  # 措施后 AP
             ])
-
-        add_table(doc, ["序号", "措施类型", "措施描述", "责任人", "截止日期", "状态"],
+        add_table(doc,
+                  ["序号", "失效模式", "措施类型", "措施描述", "责任人", "截止日期", "状态",
+                   "措施后 S", "措施后 O", "措施后 D", "措施后 AP"],
                   measure_rows,
-                  col_widths_cm=[1.5, 2.5, 5.5, 2, 2.5, 2],
-                  status_col=6)
+                  col_widths_cm=[1, 3, 1.5, 4, 1.2, 1.5, 1.2, 1, 1, 1, 1.2],
+                  status_col=7)
+    else:
+        add_paragraph(doc, "（无优化措施数据，所有失效链 AP 均为 L）", indent=True)
 
-    # ---------- 第 7 章：结论与建议 ----------
-    add_heading(doc, "第七章 结论与建议", level=1)
+    # ===== 表 7：风险矩阵 + 风险统计（对应 xlsx Sheet 7） =====
+    add_heading(doc, "表 7  风险矩阵（S×O 热力图，D=5 中位数）", level=1)
 
-    add_paragraph(doc,
-        f"本 FMEA 分析基于 AIAG & VDA FMEA 手册（2019 版）七步法编制，"
-        f"共识别 {len(chains)} 条失效链，其中高优先级（AP=H）{h_count} 项、"
-        f"中优先级（AP=M）{m_count} 项、低优先级（AP=L）{l_count} 项。"
-    )
+    # 7.1 S×O 矩阵表（10x10）
+    matrix_headers = ["S\\O"] + [str(o) for o in range(1, 11)]
+    matrix_rows = []
+    for s in range(10, 0, -1):
+        row = [str(s)]
+        for o in range(1, 11):
+            ap = get_ap_priority(s, o, 5)
+            row.append(ap)
+        matrix_rows.append(row)
+    add_table(doc, matrix_headers, matrix_rows,
+              col_widths_cm=[1] + [0.9]*10,
+              ap_col=None)  # AP 列已经是字符串，不需要再高亮（用通用样式）
 
-    add_paragraph(doc, "建议：")
-    add_paragraph(doc, "1. 优先处理 AP=H 的失效链，制定详细措施并跟踪实施；", indent=True)
-    add_paragraph(doc, "2. 对于 S=9-10 的失效影响（CC 关键特性），必须由管理层评审；", indent=True)
-    add_paragraph(doc, "3. 将识别出的 CC/SC 同步到控制计划（CP）；", indent=True)
-    add_paragraph(doc, "4. 措施实施后重新评估 S/O/D，验证 AP 是否降低；", indent=True)
-    add_paragraph(doc, "5. FMEA 文档应定期评审和更新，特别是在产品设计/工艺变更时。", indent=True)
+    # 7.2 风险统计表
+    add_heading(doc, "表 7-2  风险统计", level=2)
+    h_count = sum(1 for c in chains if c.get("ap") == "H")
+    m_count = sum(1 for c in chains if c.get("ap") == "M")
+    l_count = sum(1 for c in chains if c.get("ap") == "L")
+    cc_count = sum(1 for c in chains if c.get("s", 0) >= 9)
+    sc_count = sum(1 for c in chains if c.get("s", 0) == 8 and c.get("ap") in ("H", "M"))
 
-    # 签名栏
+    stats_rows = [
+        ["失效链总数", str(len(chains))],
+        ["AP=H（高优先级）", str(h_count)],
+        ["AP=M（中优先级）", str(m_count)],
+        ["AP=L（低优先级）", str(l_count)],
+        ["CC（关键特性，S≥9）", str(cc_count)],
+        ["SC（特殊特性，S=8 且 AP=H/M）", str(sc_count)],
+    ]
+    add_table(doc, ["统计项", "数量"], stats_rows,
+              col_widths_cm=[8, 3])
+
+    # 7.3 图例
     add_paragraph(doc, "")
-    add_paragraph(doc, "签名栏：", bold=True)
+    add_paragraph(doc, "图例：H=高优先级（红）  M=中优先级（黄）  L=低优先级（绿）", indent=True)
+
+    # ===== 签名栏 =====
+    add_heading(doc, "签名栏", level=1)
     sign_rows = [
         ["编制（FMEA 推进者）", "____", "____", "____"],
         ["审核（质量经理）", "____", "____", "____"],

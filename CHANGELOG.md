@@ -1,6 +1,75 @@
 # 变更记录
 
+## [2.0.2] - 2026-06-28
+
+### 修复：Windows 编码问题 + docx 改为纯表格
+
+**问题背景**：v2.0.1 在 Linux 测试环境正常，但部署到 Windows ECS 服务器后出现两个问题：
+1. **Windows 编码乱码**：Windows 服务器默认 stdout 编码是 GBK/CP936，subprocess 调用时中文输出（如产品名"前副车架焊接总成"）会乱码，导致 JLAGENT 的 generate_fmea_report_tool 解析脚本输出失败，Agent 退回到 export_xlsx_tool 兜底（生成的下载链接为空）。
+2. **docx 不是表格**：用户反馈"我要表格而不是报告，docx 和 xlsx 都应该是表格内容，内容应该是一样的"。v2.0.1 的 docx 是"7 章报告"（段落+表格混合），与 xlsx 的 7 Sheet 表格内容不一致。
+
+### 修复 1：Windows 编码强制 UTF-8
+
+在 `generate_fmea.py` 开头强制设置 stdout/stderr 为 UTF-8 编码：
+
+```python
+import sys
+import io
+if hasattr(sys.stdout, 'buffer'):
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace', line_buffering=True)
+if hasattr(sys.stderr, 'buffer'):
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace', line_buffering=True)
+```
+
+同时在 JLAGENT 的 `tools.py` 中，subprocess.run 调用时传入 `env={'PYTHONIOENCODING': 'utf-8', 'PYTHONUTF8': '1'}`，双重保险确保 Windows 下中文输出正确。
+
+### 修复 2：docx 改为纯表格版本（与 xlsx 7 Sheet 完全一致）
+
+完全重写 `create_docx_report` 函数，从"7 章报告"改为"7 个表格"：
+
+| 表号 | 内容 | 对应 xlsx Sheet |
+|---|---|---|
+| 表 1 | 表头信息（18 行 × 2 列，键值对） | Sheet 1 表头 |
+| 表 2 | 结构分析（层级/要素/说明） | Sheet 2 结构分析 |
+| 表 3 | 功能分析（层级/要素/功能） | Sheet 3 功能分析 |
+| 表 4 | 失效分析（序号/FE/FM/FC） | Sheet 4 失效分析 |
+| 表 5 | 风险分析（序号/FE/FM/PC/DC/S/O/D/AP/特殊特性） | Sheet 5 风险分析 |
+| 表 6 | 优化措施（序号/FM/类型/描述/责任人/截止/状态/后S/后O/后D/后AP） | Sheet 6 优化措施 |
+| 表 7 | 风险矩阵（10×10 S×O 热力图）+ 风险统计（6 项） | Sheet 7 风险矩阵 |
+| 签名栏 | 编制/审核/批准（4 列） | — |
+
+**变化对比**：
+- 段落数：42 段 → 15 段（只剩标题和小提示，无大段报告文字）
+- 表格数：8 个 → 7 个（与 xlsx 7 Sheet 完全对应）
+- 内容：与 xlsx 完全一致（同样的失效链、S/O/D、AP、CC/SC、措施）
+
+**样式保持**：
+- 表头：深蓝底白字加粗（HEADER_FILL = #1F4E79）
+- 交替行：浅蓝底（ALT_ROW_FILL = #E7EEF7）
+- AP 列：H=红 / M=黄 / L=绿 高亮
+- 特殊特性列：CC=红底 / SC=黄底
+- 措施状态列：进行中=黄 / 已完成=绿
+- 页眉：显示 FMEA 编号
+
+### 兼容性
+
+- 完全向后兼容：v2.0.1 的所有命令行参数和模板格式不变
+- xlsx 输出不变：仍然是 7 Sheet 结构（这次只改 docx）
+- auto_fill 行为不变：表头/团队/优化措施/签名栏的 ____ 仍会自动填充
+
+### 实测验证
+
+| 测试场景 | 失效链数 | docx 表格数 | 编码 |
+|---|---|---|---|
+| DFMEA + mechanical-assembly + auto_fill | 7 | 7 | UTF-8 ✅ |
+| PFMEA + generic-fmea + auto_fill | 5 | 7 | UTF-8 ✅ |
+| 模拟 Windows GBK 环境（LANG=zh_CN.GBK） | 7 | 7 | 脚本强制 UTF-8 ✅ |
+| 模拟 tools.py 调用（PYTHONIOENCODING=utf-8） | 7 | 7 | 双重保险 ✅ |
+
+---
+
 ## [2.0.1] - 2026-06-28
+
 
 ### 重构：脚本工程化升级（对标 8D Skill 的工程化深度）
 
