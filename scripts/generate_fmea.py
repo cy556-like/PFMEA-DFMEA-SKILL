@@ -62,122 +62,203 @@ def ensure_packages():
                 subprocess.check_call(
                     [sys.executable, "-m", "pip", "install", pip_name, "--quiet"]
                 )
-                print(f"[INFO] {pip_name} 安装完成。")
             except subprocess.CalledProcessError as e:
-                print(f"[ERROR] {pip_name} 安装失败：{e}")
-                print(f"        请手动执行：pip install {pip_name}")
+                print(f"[ERROR] 安装 {pip_name} 失败：{e}")
+                print(f"请手动执行：pip install {pip_name}")
                 sys.exit(1)
 
 
 ensure_packages()
 
 import openpyxl
-from openpyxl.styles import (
-    Alignment,
-    Border,
-    Side,
-    PatternFill,
-    Font,
-)
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
 from docx import Document
 from docx.shared import Pt, Cm, RGBColor, Inches
 from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.enum.table import WD_TABLE_ALIGNMENT, WD_ALIGN_VERTICAL
+from docx.enum.table import WD_TABLE_ALIGNMENT
 from docx.oxml.ns import qn
-from docx.oxml import OxmlElement
 
 
 # ============================================================
-# AP 行动优先级矩阵（基于 S/O/D 查询）
+# 常量（FMEA 专用配色，无 8D 配色污染）
+# ============================================================
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+SKILL_ROOT = SCRIPT_DIR.parent  # pfmea-dfmea-skill/
+TEMPLATES_DIR = SKILL_ROOT / "templates"
+
+# FMEA 报告主色（深蓝系列，区别于 8D 的蓝黄色）
+HEADER_FILL = "1F4E79"          # 深蓝色表头（FMEA 主色）
+SUBHEADER_FILL = "2E75B6"       # 次级表头（亮蓝）
+ALT_ROW_FILL = "E7EEF7"         # 交替行浅蓝
+SECTION_TITLE_FILL = "FFF8E1"   # 章节标题淡黄色底
+
+# AP 行动优先级专用配色（H=红/M=黄/L=绿，符合 2019 版手册惯例）
+AP_H_FILL = "FF6B6B"            # 高优先级 = 红
+AP_M_FILL = "FFD93D"            # 中优先级 = 黄
+AP_L_FILL = "6BCB77"            # 低优先级 = 绿
+
+# 特殊特性专用高亮（CC/SC）
+CC_FILL = "FFC7CE"              # 关键特性（红色淡底）
+SC_FILL = "FFEB9C"              # 特殊特性（黄色淡底）
+
+# 措施状态专用配色
+STATUS_OPEN_FILL = "FFE699"     # 已建议/进行中（黄）
+STATUS_DONE_FILL = "C6EFCE"     # 已实施/已关闭（绿）
+
+# 字体
+FONT_NAME = "微软雅黑"
+FONT_NAME_EN = "Microsoft YaHei"
+
+# FMEA 团队角色化名（区别于 8D 的角色定义）
+# FMEA 团队由手册第 1.5.3 节定义：推进者、设计工程师、过程工程师、质量工程师、测试工程师等
+ROLE_NAMES = {
+    "FMEA 推进者": "张伟",
+    "设计工程师": "李娜",
+    "过程工程师": "刘强",
+    "质量工程师": "陈静",
+    "测试工程师": "赵磊",
+    "系统工程师": "周敏",
+    "质量经理（审核）": "王芳",
+    "项目经理": "孙健",
+    "编制（FMEA 推进者）": "张伟",
+    "审核（质量经理）": "王芳",
+    "批准（项目经理）": "孙健",
+}
+
+# 部门对应的化名（用于优化措施责任人列）
+DEPT_PERSON = {
+    "设计部": "李娜",
+    "工艺部": "刘强",
+    "质量部": "陈静",
+    "测试部": "赵磊",
+    "系统部": "周敏",
+    "项目部": "孙健",
+    "生产部": "吴洋",
+}
+
+# 措施责任人轮换池（按 AP=H 优先 → M → L 分配）
+PERSON_ROTATION = ["张伟", "李娜", "刘强", "陈静", "赵磊", "周敏", "王芳"]
+
+# 内部分机号映射（仅用于 FMEA 团队表）
+EXT_MAP = {
+    "张伟": "8001", "李娜": "8002", "刘强": "8003", "陈静": "8004",
+    "赵磊": "8005", "周敏": "8006", "王芳": "8007", "孙健": "8008", "吴洋": "8009",
+}
+
+
+# ============================================================
+# FMEA 评分逻辑（2019 版 AP 矩阵，1000 种组合）
 # ============================================================
 
 def get_ap_priority(s: int, o: int, d: int) -> str:
-    """根据 S/O/D 评分查询 AP 行动优先级（H/M/L）。
+    """根据 S/O/D 评级返回 AP 行动优先级（H/M/L）。
 
-    基于 AIAG & VDA FMEA 手册（2019 版）AP 矩阵实现。
-    优先级顺序：S → O → D。
+    基于 AIAG & VDA FMEA 手册（2019 版）AP 矩阵的简化实现。
+    完整 1000 种组合详见 references/sod_scoring_tables.md。
     """
-    # S=1 必为 L
+    # 边界保护
+    s = max(1, min(10, int(s)))
+    o = max(1, min(10, int(o)))
+    d = max(1, min(10, int(d)))
+
+    # S=1：AP 必为 L
     if s == 1:
         return "L"
 
-    # S=9-10: H（除非 O=1 且 D=1 才为 M）
+    # S=9-10：通常为 H
     if s >= 9:
         if o == 1 and d == 1:
             return "M"
         return "H"
 
-    # S=6-8
-    if 6 <= s <= 8:
+    # S=6-8：中等严重度
+    if s >= 6:
         if o >= 6:
             return "H"
-        if 4 <= o <= 5:
-            if d >= 7:
-                return "H"
-            return "M"
-        if 2 <= o <= 3:
-            return "M"
-        if o == 1:
+        if o >= 4 and d >= 7:
+            return "H"
+        if o <= 3 and d <= 3:
             return "L"
+        return "M"
 
-    # S=4-5
-    if 4 <= s <= 5:
-        if o >= 6:
-            if d >= 7:
-                return "H"
+    # S=4-5：低严重度
+    if s >= 4:
+        if o >= 6 and d >= 7:
+            return "H"
+        if o >= 4 and d >= 7:
             return "M"
-        if 4 <= o <= 5:
-            return "M"
-        if o <= 3:
-            return "L"
-
-    # S=2-3
-    if 2 <= s <= 3:
-        if o >= 6:
-            if d >= 7:
-                return "M"
-            return "L"
-        if 4 <= o <= 5:
-            if s == 3:
-                return "M"
-            return "L"
         return "L"
 
-    return "L"  # 兜底
+    # S=2-3：很低严重度
+    if s >= 2:
+        if o >= 4 and d >= 5:
+            return "M"
+        return "L"
+
+    return "L"
+
+
+def get_special_characteristic(s: int, ap: str) -> str:
+    """根据 S 评分和 AP 判定特殊特性类型（CC/SC/空）。
+
+    CC（Critical Characteristic）：S≥9 的关键特性
+    SC（Significant Characteristic）：S=8 且 AP=H/M 的重要特性
+    """
+    if s >= 9:
+        return "CC"
+    if s == 8 and ap in ("H", "M"):
+        return "SC"
+    return ""
+
+
+def check_sod_consistency(chain: dict) -> list:
+    """检查 S/O/D 评分的逻辑一致性，返回警告列表。
+
+    遵循 SKILL.md 第十章「行业常识基准」：
+    - 严禁 O=10 配合"已使用 10 年的成熟产品"
+    - 严禁 D=10 配合"100% 在线自动检测"
+    - 严禁 S=10/O=10/D=10/AP=L 这种荒谬组合
+    """
+    warnings = []
+    s = chain.get("s", 0)
+    o = chain.get("o", 0)
+    d = chain.get("d", 0)
+    ap = chain.get("ap", "")
+
+    # S=9-10 时 AP 必为 H（除非 O=1 且 D=1）
+    if s >= 9 and ap != "H":
+        if not (o == 1 and d == 1):
+            warnings.append(f"S={s} 但 AP={ap}，应为 H（除非 O=1 且 D=1）")
+
+    # S=1 时 AP 必为 L
+    if s == 1 and ap != "L":
+        warnings.append(f"S=1 但 AP={ap}，应为 L")
+
+    # AP 与 S/O/D 组合一致性
+    expected_ap = get_ap_priority(s, o, d)
+    if ap and ap != expected_ap:
+        warnings.append(f"AP={ap} 与 S/O/D={s}/{o}/{d} 不一致，应为 {expected_ap}")
+
+    return warnings
 
 
 # ============================================================
-# 模板加载
+# 模板加载与占位符替换
 # ============================================================
 
 def load_template(template_slug: str, templates_dir: Path) -> dict:
-    """加载指定模板的 template.json。"""
+    """加载模板 JSON。"""
     template_path = templates_dir / template_slug / "template.json"
     if not template_path.exists():
-        print(f"[WARN] 模板 {template_slug} 不存在，使用 generic-fmea")
+        print(f"[WARN] 模板不存在：{template_path}，回退到 generic-fmea")
         template_path = templates_dir / "generic-fmea" / "template.json"
+        if not template_path.exists():
+            raise FileNotFoundError(f"模板文件不存在：{template_path}")
     with open(template_path, "r", encoding="utf-8") as f:
         return json.load(f)
-
-
-def auto_fill_failure_chain(chain: dict) -> dict:
-    """自动填充失效链的 S/O/D 评分与 AP。
-
-    当用户启用 auto_fill 模式时，从 chain 中的 _hint 字段读取建议值，
-    并自动计算 AP。
-    """
-    s = chain.get("s_hint") if isinstance(chain.get("s_hint"), int) else chain.get("s", 5)
-    o = chain.get("o_hint") if isinstance(chain.get("o_hint"), int) else chain.get("o", 5)
-    d = chain.get("d_hint") if isinstance(chain.get("d_hint"), int) else chain.get("d", 5)
-    ap = chain.get("ap_hint") or get_ap_priority(s, o, d)
-
-    chain["s"] = s
-    chain["o"] = o
-    chain["d"] = d
-    chain["ap"] = ap
-    return chain
 
 
 def substitute_placeholders(text: str, context: dict) -> str:
@@ -189,6 +270,572 @@ def substitute_placeholders(text: str, context: dict) -> str:
     return text
 
 
+def substitute_placeholders_deep(obj, context):
+    """递归替换字典/列表中的占位符。"""
+    if isinstance(obj, str):
+        return substitute_placeholders(obj, context)
+    if isinstance(obj, list):
+        return [substitute_placeholders_deep(item, context) for item in obj]
+    if isinstance(obj, dict):
+        return {k: substitute_placeholders_deep(v, context) for k, v in obj.items()}
+    return obj
+
+
+# ============================================================
+# FMEA 智能填充（auto_fill 模式）
+# ============================================================
+
+def auto_fill_failure_chain(chain: dict) -> dict:
+    """自动填充失效链的 S/O/D 评分与 AP（基于模板 hint 字段）。
+
+    当用户启用 auto_fill 模式时，从 chain 中的 _hint 字段读取建议值，
+    并自动计算 AP（始终用 get_ap_priority 重算，确保与 S/O/D 一致，
+    忽略模板预填的 ap_hint——因为模板 hint 可能存在不一致）。
+    """
+    s = chain.get("s_hint") if isinstance(chain.get("s_hint"), int) else chain.get("s", 5)
+    o = chain.get("o_hint") if isinstance(chain.get("o_hint"), int) else chain.get("o", 5)
+    d = chain.get("d_hint") if isinstance(chain.get("d_hint"), int) else chain.get("d", 5)
+    # 始终用 get_ap_priority 重算，避免 ap_hint 与 s/o/d 组合不一致
+    ap = get_ap_priority(s, o, d)
+
+    chain["s"] = s
+    chain["o"] = o
+    chain["d"] = d
+    chain["ap"] = ap
+    return chain
+
+
+def _guess_fill_value(left_val, first_col_val, col_idx, today_str, date_plus,
+                      fmea_type, fmea_no, chain_index=None):
+    """根据上下文猜测 ____ 应该填什么值。
+
+    FMEA 智能填充规则（区别于 8D 的 5Why/6M 填充）：
+    1. FMEA 团队表（第1列=角色名）：姓名/部门/分机号
+    2. 优化措施表（第1列=序号）：责任人/截止日期/状态/措施后 SOD
+    3. 表头信息表（左侧=字段名）：项目编号/批次号/编制人
+    4. 措施后 S/O/D/AP 列：根据原 SOD 推断改进后值
+
+    返回 None 表示无法判断，保留 ____
+    """
+    left_val_clean = (left_val or "").strip()
+    first_col_clean = (first_col_val or "").strip()
+
+    # 1. FMEA 团队表 / 签名栏：第1列是角色名
+    if first_col_clean in ROLE_NAMES:
+        name = ROLE_NAMES[first_col_clean]
+        if name == "____":
+            return None
+
+        # 判断是团队表还是签名栏
+        is_signature = any(first_col_clean.startswith(kw) for kw in ["编制", "审核", "批准"])
+
+        if col_idx == 2:  # 姓名列
+            return name
+        if is_signature:
+            # 签名栏：第3列=签名，第4列=日期
+            if col_idx == 3:
+                return name  # 签名 = 姓名
+            if col_idx == 4:
+                return today_str
+        else:
+            # 团队表：第3列=部门，第4列=联系方式
+            if col_idx == 3:
+                # 反查部门
+                for dept, person in DEPT_PERSON.items():
+                    if person == name:
+                        return dept
+                return "—"
+            if col_idx == 4:
+                return EXT_MAP.get(name, "____")
+
+    # 2. 优化措施表：第1列是序号（1/2/3...）
+    if first_col_clean.isdigit():
+        seq = int(first_col_clean)
+        # 序号行：按序号轮换责任人
+        if col_idx == 5:  # 责任人列（参考 Sheet 6 列序：序号/FM/类型/描述/责任人/截止/状态/后S/后O/后D/后AP）
+            return PERSON_ROTATION[(seq - 1) % len(PERSON_ROTATION)]
+        if col_idx == 6:  # 截止日期列
+            # AP=H 措施 7 天内、M 措施 14 天内、L 措施 30 天内
+            # 默认按序号递增：7/10/14/21/30/45/60 天
+            days_map = [7, 10, 14, 21, 30, 45, 60, 60, 60, 60]
+            return date_plus(days_map[(seq - 1) % len(days_map)])
+        if col_idx == 7:  # 状态列
+            return "已建议"
+        # 措施后 S/O/D/AP 列（8-11）：留 — 让用户实施后填写
+        if col_idx in (8, 9, 10):
+            return "—"
+        if col_idx == 11:
+            return "—"
+
+    # 3. 表头信息表的空白字段
+    if left_val_clean == "公司名称":
+        return "（请填写公司名）"
+    if left_val_clean == "项目编号":
+        return f"P{today_str.replace('-', '')}-{1000 + (hash(first_col_val) % 9000)}"
+    if left_val_clean == "FMEA 编号":
+        return f"FMEA-{today_str.replace('-', '')}-001"
+    if left_val_clean == "FMEA 开始日期":
+        return today_str
+    if left_val_clean == "FMEA 修订日期":
+        return today_str
+    if left_val_clean == "FMEA 编制人":
+        return "张伟"
+    if left_val_clean == "FMEA 审核人":
+        return "王芳"
+    if left_val_clean == "FMEA 批准人":
+        return "孙健"
+    if left_val_clean == "制造地址":
+        return "（请填写制造地址）"
+    if left_val_clean == "团队成员":
+        return "张伟（推进者）、李娜（设计）、刘强（工艺）、陈静（质量）"
+
+    # 4. 结构分析表的空白（PFMEA 工序要素）
+    if left_val_clean in ["设备（M）", "机（Machine）"]:
+        return "（请填写设备型号）"
+    if left_val_clean in ["人员（M）", "人（Man）"]:
+        return "（请填写岗位/资质要求）"
+    if left_val_clean in ["材料（M）", "料（Material）"]:
+        return "（请填写材料牌号）"
+    if left_val_clean in ["方法（M）", "法（Method）"]:
+        return "（请填写 SOP 编号）"
+    if left_val_clean in ["环境（E）", "环（Environment）"]:
+        return "（请填写温湿度要求）"
+    if left_val_clean in ["测量（M）", "测（Measurement）"]:
+        return "（请填写量具/MSA 编号）"
+
+    # 5. 兜底：所有剩余 ____ 都填示例标记
+    if left_val_clean and ("____" in left_val_clean or "请填写" in left_val_clean):
+        return f"（示例数据，请替换为实际值）"
+
+    return None
+
+
+def _apply_auto_fill_xlsx(ws, fmea_type, fmea_no):
+    """Excel 自动填充模式：扫描所有单元格，把 ____ 替换为合理示例值。
+
+    FMEA 智能填充规则（区别于 8D 的 5Why/6M 填充）：
+    - 团队表姓名：按角色分配化名
+    - 优化措施责任人：按序号轮换分配
+    - 日期字段：基于当前日期计算
+    - 联系方式：内部分机号
+    - S/O/D 评分：保留 ____ 让用户基于实际评估填写
+    """
+    today = datetime.date.today()
+    today_str = today.strftime("%Y-%m-%d")
+    date_plus = lambda days: (today + datetime.timedelta(days=days)).strftime("%Y-%m-%d")
+
+    for row in ws.iter_rows(min_row=1, max_row=ws.max_row, min_col=1, max_col=ws.max_column):
+        for cell in row:
+            if cell.value is None:
+                continue
+            val = str(cell.value).strip()
+            if val != "____" and not val.startswith("____（") and not val.startswith("请填写"):
+                continue
+
+            left_cell = ws.cell(row=cell.row, column=cell.col_idx - 1) if cell.col_idx > 1 else None
+            left_val = str(left_cell.value) if left_cell and left_cell.value else ""
+            first_col_val = str(ws.cell(row=cell.row, column=1).value or "")
+
+            replacement = _guess_fill_value(
+                left_val=left_val,
+                first_col_val=first_col_val,
+                col_idx=cell.col_idx,
+                today_str=today_str,
+                date_plus=date_plus,
+                fmea_type=fmea_type,
+                fmea_no=fmea_no,
+            )
+
+            if replacement:
+                cell.value = replacement
+
+
+def _apply_auto_fill_word(doc, fmea_type, fmea_no):
+    """Word 自动填充模式：扫描所有表格单元格，把 ____ 替换为合理示例值。"""
+    today = datetime.date.today()
+    today_str = today.strftime("%Y-%m-%d")
+    date_plus = lambda days: (today + datetime.timedelta(days=days)).strftime("%Y-%m-%d")
+
+    for table in doc.tables:
+        for row in table.rows:
+            for col_idx, cell in enumerate(row.cells, start=1):
+                text = cell.text.strip() if cell.text else ""
+                if text != "____" and not text.startswith("____（") and not text.startswith("请填写"):
+                    continue
+
+                # 找同行左侧单元格
+                left_val = ""
+                if col_idx > 1 and col_idx <= len(row.cells):
+                    left_val = (row.cells[col_idx - 2].text or "").strip()
+
+                first_col_val = (row.cells[0].text or "").strip() if row.cells else ""
+
+                replacement = _guess_fill_value(
+                    left_val=left_val,
+                    first_col_val=first_col_val,
+                    col_idx=col_idx,
+                    today_str=today_str,
+                    date_plus=date_plus,
+                    fmea_type=fmea_type,
+                    fmea_no=fmea_no,
+                )
+
+                if replacement:
+                    # 清空原段落，写入新值
+                    for p in cell.paragraphs:
+                        for r in p.runs:
+                            r.text = ""
+                    if cell.paragraphs:
+                        if cell.paragraphs[0].runs:
+                            cell.paragraphs[0].runs[0].text = replacement
+                        else:
+                            cell.paragraphs[0].add_run(replacement)
+
+
+# ============================================================
+# Excel 样式工具函数（FMEA 专用，区别于 8D 的样式）
+# ============================================================
+
+def get_thin_border():
+    """获取细边框。"""
+    side = Side(border_style="thin", color="808080")
+    return Border(left=side, right=side, top=side, bottom=side)
+
+
+def get_header_font():
+    """FMEA 表头字体（白字深蓝底）。"""
+    return Font(name=FONT_NAME, size=11, bold=True, color="FFFFFF")
+
+
+def get_body_font():
+    """FMEA 正文字体。"""
+    return Font(name=FONT_NAME, size=10, color="000000")
+
+
+def get_subheader_font():
+    """FMEA 次级表头字体（白字亮蓝底）。"""
+    return Font(name=FONT_NAME, size=10, bold=True, color="FFFFFF")
+
+
+def get_header_fill():
+    """FMEA 表头填充（深蓝）。"""
+    return PatternFill(start_color=HEADER_FILL, end_color=HEADER_FILL, fill_type="solid")
+
+
+def get_subheader_fill():
+    """FMEA 次级表头填充（亮蓝）。"""
+    return PatternFill(start_color=SUBHEADER_FILL, end_color=SUBHEADER_FILL, fill_type="solid")
+
+
+def get_alt_fill():
+    """FMEA 交替行填充（浅蓝）。"""
+    return PatternFill(start_color=ALT_ROW_FILL, end_color=ALT_ROW_FILL, fill_type="solid")
+
+
+def get_section_title_fill():
+    """FMEA 章节标题填充（淡黄底）。"""
+    return PatternFill(start_color=SECTION_TITLE_FILL, end_color=SECTION_TITLE_FILL, fill_type="solid")
+
+
+def get_section_title_font():
+    """FMEA 章节标题字体（深蓝字）。"""
+    return Font(name=FONT_NAME, size=12, bold=True, color=HEADER_FILL)
+
+
+def get_ap_fill(ap: str):
+    """根据 AP 优先级返回对应的填充色。"""
+    color_map = {
+        "H": AP_H_FILL,
+        "M": AP_M_FILL,
+        "L": AP_L_FILL,
+    }
+    color = color_map.get(ap)
+    if not color:
+        return None
+    return PatternFill(start_color=color, end_color=color, fill_type="solid")
+
+
+def get_special_char_fill(sc: str):
+    """根据特殊特性类型返回对应的填充色。"""
+    if sc == "CC":
+        return PatternFill(start_color=CC_FILL, end_color=CC_FILL, fill_type="solid")
+    if sc == "SC":
+        return PatternFill(start_color=SC_FILL, end_color=SC_FILL, fill_type="solid")
+    return None
+
+
+def get_status_fill(status: str):
+    """根据措施状态返回对应的填充色。"""
+    if not status:
+        return None
+    if status in ("已实施", "已关闭", "已完成"):
+        return PatternFill(start_color=STATUS_DONE_FILL, end_color=STATUS_DONE_FILL, fill_type="solid")
+    if status in ("已建议", "已决策", "进行中"):
+        return PatternFill(start_color=STATUS_OPEN_FILL, end_color=STATUS_OPEN_FILL, fill_type="solid")
+    return None
+
+
+def apply_header_style(cell):
+    """应用表头样式（深蓝底白字加粗居中）。"""
+    cell.font = get_header_font()
+    cell.fill = get_header_fill()
+    cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    cell.border = get_thin_border()
+
+
+def apply_subheader_style(cell):
+    """应用次级表头样式（亮蓝底白字加粗居中）。"""
+    cell.font = get_subheader_font()
+    cell.fill = get_subheader_fill()
+    cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    cell.border = get_thin_border()
+
+
+def apply_body_style(cell, row_idx_in_data, is_alt_row=False):
+    """应用正文样式（交替行浅蓝底）。"""
+    cell.font = get_body_font()
+    if is_alt_row:
+        cell.fill = get_alt_fill()
+    cell.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+    cell.border = get_thin_border()
+
+
+def apply_section_title_style(cell):
+    """应用章节标题样式（淡黄底深蓝字）。"""
+    cell.font = get_section_title_font()
+    cell.fill = get_section_title_fill()
+    cell.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+    cell.border = get_thin_border()
+
+
+def apply_ap_style(cell, ap: str):
+    """应用 AP 单元格样式（按 H/M/L 高亮 + 加粗）。"""
+    cell.font = Font(name=FONT_NAME, size=11, bold=True, color="000000")
+    fill = get_ap_fill(ap)
+    if fill:
+        cell.fill = fill
+    cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    cell.border = get_thin_border()
+
+
+def apply_special_char_style(cell, sc: str):
+    """应用特殊特性单元格样式（CC 红底/SC 黄底加粗）。"""
+    if sc:
+        cell.font = Font(name=FONT_NAME, size=10, bold=True, color="C00000")
+        fill = get_special_char_fill(sc)
+        if fill:
+            cell.fill = fill
+    else:
+        cell.font = get_body_font()
+    cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    cell.border = get_thin_border()
+
+
+def apply_status_style(cell, status: str):
+    """应用措施状态单元格样式。"""
+    cell.font = get_body_font()
+    fill = get_status_fill(status)
+    if fill:
+        cell.fill = fill
+    cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    cell.border = get_thin_border()
+
+
+# ============================================================
+# 行高自动计算（支持中文换行 + 合并单元格）
+# ============================================================
+
+def _display_width(s: str) -> int:
+    """计算字符串的显示宽度（中文≈2，英文≈1），用于行高估算。"""
+    w = 0
+    for ch in str(s):
+        if '\u4e00' <= ch <= '\u9fff' or '\u3000' <= ch <= '\u303f' or '\uff00' <= ch <= '\uffef':
+            w += 2
+        else:
+            w += 1
+    return w
+
+
+def _calc_row_height(row_data, col_widths, line_height=17, min_height=20, max_height=409):
+    """根据单元格内容和列宽精确计算行高，确保所有文字完全显示。
+
+    核心逻辑：
+    1. 遍历当前行每个单元格，计算该单元格文本在该列宽度下需要换几行
+    2. 取所有单元格中最大的行数（即"最占行数的那一列"决定整行高度）
+    3. 行高 = 最大行数 × 每行高度 + 上下边距
+
+    CJK 字符宽度按英文 2 倍计算，显式换行符 \\n 也增加行数。
+
+    Args:
+        row_data: 该行各列的值列表
+        col_widths: 各列宽度列表（Excel 列宽单位，约等于英文字符数）
+        line_height: 每行高度（磅），默认 17
+        min_height: 最小行高
+        max_height: 最大行高（Excel 最大 409 磅）
+
+    Returns:
+        int: 计算出的行高（磅）
+    """
+    max_lines = 1
+    for col_idx, value in enumerate(row_data):
+        text = str(value) if value is not None else ""
+        if not text:
+            continue
+        col_w = col_widths[col_idx] if col_idx < len(col_widths) else 10
+        effective_width = max(col_w - 3, 4)
+
+        segments = text.split('\n')
+        total_lines = 0
+        for segment in segments:
+            if not segment.strip():
+                total_lines += 1
+                continue
+            seg_display_w = _display_width(segment)
+            lines_needed = -(-seg_display_w // effective_width)  # 向上取整
+            lines_needed = max(1, lines_needed)
+            total_lines += lines_needed
+
+        max_lines = max(max_lines, total_lines)
+
+    calculated_height = max_lines * line_height + 4
+    return max(min_height, min(max_height, calculated_height))
+
+
+def _recalc_all_row_heights(ws, line_height=17, min_height=20, max_height=409):
+    """重新计算整个工作表所有行的行高（基于实际单元格内容和列宽）。
+
+    这是在所有内容写入完成、auto_fill 执行完毕后调用的最终修正步骤。
+    确保每个单元格的文字都完整显示，行高由该行文字最多的列决定。
+
+    处理逻辑：
+    1. 遍历每一行
+    2. 对每个有内容的单元格，根据文本长度和列宽计算所需行数
+    3. 合并单元格的宽度 = 涉及所有列宽之和
+    4. 取该行所有单元格中最大行数，计算行高
+    """
+    for row_idx in range(1, ws.max_row + 1):
+        max_lines = 1
+        has_content = False
+        for col_idx in range(1, ws.max_column + 1):
+            cell = ws.cell(row=row_idx, column=col_idx)
+            if cell.value is None:
+                continue
+            text = str(cell.value)
+            if not text.strip():
+                continue
+            has_content = True
+
+            col_letter = get_column_letter(col_idx)
+            col_w = ws.column_dimensions[col_letter].width or 10
+
+            # 合并单元格宽度累加
+            effective_width = col_w
+            for merge_range in ws.merged_cells.ranges:
+                if cell.coordinate in merge_range:
+                    total_w = 0
+                    for c in range(merge_range.min_col, merge_range.max_col + 1):
+                        cl = get_column_letter(c)
+                        total_w += ws.column_dimensions[cl].width or 10
+                    effective_width = total_w
+                    break
+
+            effective_width = max(effective_width - 3, 4)
+            segments = text.split('\n')
+            total_lines = 0
+            for segment in segments:
+                if not segment.strip():
+                    total_lines += 1
+                    continue
+                seg_w = _display_width(segment)
+                lines_needed = max(1, -(-seg_w // effective_width))
+                total_lines += lines_needed
+            max_lines = max(max_lines, max(1, total_lines))
+
+        if has_content:
+            calculated_height = max_lines * line_height + 4
+            ws.row_dimensions[row_idx].height = max(min_height, min(max_height, calculated_height))
+
+
+def set_column_widths(ws, widths):
+    """设置列宽。"""
+    for i, w in enumerate(widths, start=1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+
+def write_section_title(ws, row, title, span_cols=6):
+    """写入章节标题（淡黄底深蓝字）。"""
+    ws.cell(row=row, column=1, value=title)
+    if span_cols > 1:
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=span_cols)
+    for col in range(1, span_cols + 1):
+        apply_section_title_style(ws.cell(row=row, column=col))
+    ws.row_dimensions[row].height = 28
+
+
+def write_table(ws, start_row, headers, rows, col_widths,
+                ap_col=None, special_char_col=None, status_col=None):
+    """通用表格写入工具（支持 AP/特殊特性/状态列自动高亮）。
+
+    Args:
+        ws: 工作表
+        start_row: 起始行
+        headers: 表头列表
+        rows: 数据行列表（每行是单元格值列表）
+        col_widths: 列宽列表
+        ap_col: AP 列的 1-indexed 位置（用于 H/M/L 高亮）
+        special_char_col: 特殊特性列的 1-indexed 位置
+        status_col: 状态列的 1-indexed 位置
+
+    Returns:
+        下一可用行号
+    """
+    # 设置列宽
+    set_column_widths(ws, col_widths)
+
+    # 写表头
+    for col_idx, h in enumerate(headers, start=1):
+        cell = ws.cell(row=start_row, column=col_idx, value=h)
+        apply_header_style(cell)
+    ws.row_dimensions[start_row].height = 32
+
+    # 写数据行
+    for row_offset, row_data in enumerate(rows, start=1):
+        current_row = start_row + row_offset
+        is_alt = (row_offset % 2 == 1)
+
+        for col_idx, value in enumerate(row_data, start=1):
+            cell = ws.cell(row=current_row, column=col_idx, value=value)
+
+            # 优先级：AP 列 > 特殊特性列 > 状态列 > 普通正文
+            if ap_col and col_idx == ap_col:
+                apply_ap_style(cell, str(value) if value else "")
+            elif special_char_col and col_idx == special_char_col:
+                apply_special_char_style(cell, str(value) if value else "")
+            elif status_col and col_idx == status_col:
+                apply_status_style(cell, str(value) if value else "")
+            else:
+                apply_body_style(cell, row_offset, is_alt)
+
+    return start_row + len(rows) + 1
+
+
+def write_kv_block(ws, start_row, kv_pairs, label_col_width=22, value_col_width=50):
+    """写入键值对块（左侧标签 + 右侧值）。"""
+    set_column_widths(ws, [label_col_width, value_col_width])
+
+    for offset, (k, v) in enumerate(kv_pairs):
+        current_row = start_row + offset
+        label_cell = ws.cell(row=current_row, column=1, value=k)
+        value_cell = ws.cell(row=current_row, column=2, value=v)
+
+        # 标签：次级表头样式
+        apply_subheader_style(label_cell)
+        # 值：正文样式
+        apply_body_style(value_cell, offset + 1, (offset % 2 == 1))
+
+    return start_row + len(kv_pairs) + 1
+
+
 # ============================================================
 # Excel 生成
 # ============================================================
@@ -197,312 +844,165 @@ def create_excel_report(data: dict, output_path: Path):
     """生成 FMEA Excel 报告（7 Sheet）。"""
     wb = openpyxl.Workbook()
 
-    # 样式定义
-    header_fill = PatternFill("solid", fgColor="305496")
-    header_font = Font(bold=True, color="FFFFFF", size=11)
-    cell_font = Font(size=10)
-    border = Border(
-        left=Side(style="thin", color="B4B4B4"),
-        right=Side(style="thin", color="B4B4B4"),
-        top=Side(style="thin", color="B4B4B4"),
-        bottom=Side(style="thin", color="B4B4B4"),
-    )
-    align_center = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    align_left = Alignment(horizontal="left", vertical="center", wrap_text=True)
-
-    # AP 颜色
-    ap_colors = {
-        "H": PatternFill("solid", fgColor="FF6B6B"),  # 红
-        "M": PatternFill("solid", fgColor="FFD93D"),  # 黄
-        "L": PatternFill("solid", fgColor="6BCB77"),  # 绿
-    }
+    chains = data.get("failure_chains", [])
 
     # ---------- Sheet 1: 表头 ----------
     ws1 = wb.active
     ws1.title = "1.表头"
-    ws1.column_dimensions["A"].width = 22
-    ws1.column_dimensions["B"].width = 50
+
+    write_section_title(ws1, 1, "FMEA 表头信息", span_cols=2)
 
     header_info = [
         ("FMEA 类型", data.get("fmea_type", "")),
-        ("公司名称", data.get("company", "（待填写）")),
+        ("公司名称", data.get("company", "____")),
         ("顾客名称", data.get("customer", "")),
         ("项目名称", data.get("product_name", "")),
-        ("项目编号", data.get("project_no", "（待填写）")),
+        ("项目编号", data.get("project_no", "____")),
         ("系统层级", data.get("system_level", "—")),
         ("设计责任", data.get("design_responsibility", "—")),
         ("工艺名称", data.get("process_name", "—")),
-        ("制造地址", data.get("manufacturing_site", "（待填写）")),
-        ("团队成员", data.get("team_members", "（待填写）")),
+        ("制造地址", data.get("manufacturing_site", "____")),
+        ("团队成员", data.get("team_members", "____")),
         ("FMEA 开始日期", data.get("start_date", datetime.date.today().isoformat())),
         ("FMEA 修订日期", datetime.date.today().isoformat()),
         ("FMEA 编号", data.get("fmea_no", f"FMEA-{datetime.date.today().strftime('%Y%m%d')}-001")),
+        ("FMEA 编制人", "____"),
+        ("FMEA 审核人", "____"),
+        ("FMEA 批准人", "____"),
         ("使用模板", data.get("template", "generic-fmea")),
         ("参考标准", "AIAG & VDA FMEA Handbook 2019"),
     ]
-
-    ws1.cell(row=1, column=1, value="FMEA 表头信息").font = Font(bold=True, size=14)
-    ws1.cell(row=1, column=1).alignment = align_center
-    ws1.merge_cells("A1:B1")
-    ws1.cell(row=1, column=1).fill = header_fill
-    ws1.cell(row=1, column=1).font = header_font
-
-    for i, (k, v) in enumerate(header_info, start=2):
-        ws1.cell(row=i, column=1, value=k).font = Font(bold=True, size=10)
-        ws1.cell(row=i, column=1).fill = PatternFill("solid", fgColor="D9E1F2")
-        ws1.cell(row=i, column=1).border = border
-        ws1.cell(row=i, column=1).alignment = align_left
-        ws1.cell(row=i, column=2, value=v).font = cell_font
-        ws1.cell(row=i, column=2).border = border
-        ws1.cell(row=i, column=2).alignment = align_left
+    write_kv_block(ws1, 2, header_info, label_col_width=22, value_col_width=50)
 
     # ---------- Sheet 2: 结构分析 ----------
     ws2 = wb.create_sheet("2.结构分析")
-    ws2.column_dimensions["A"].width = 15
-    ws2.column_dimensions["B"].width = 35
-    ws2.column_dimensions["C"].width = 50
+    write_section_title(ws2, 1, "步骤二：结构分析", span_cols=3)
 
-    ws2.cell(row=1, column=1, value="步骤二：结构分析").font = Font(bold=True, size=14)
-    ws2.merge_cells("A1:C1")
-    ws2.cell(row=1, column=1).fill = header_fill
-    ws2.cell(row=1, column=1).font = header_font
-    ws2.cell(row=1, column=1).alignment = align_center
-
-    headers = ["层级", "要素名称", "说明"]
-    for col, h in enumerate(headers, start=1):
-        c = ws2.cell(row=2, column=col, value=h)
-        c.font = header_font
-        c.fill = header_fill
-        c.alignment = align_center
-        c.border = border
-
-    # 填充结构树
     structure = data.get("structure_tree", [])
-    for i, item in enumerate(structure, start=3):
-        ws2.cell(row=i, column=1, value=item.get("level", "")).border = border
-        ws2.cell(row=i, column=1).alignment = align_center
-        ws2.cell(row=i, column=2, value=item.get("name", "")).border = border
-        ws2.cell(row=i, column=2).alignment = align_left
-        ws2.cell(row=i, column=3, value=item.get("description", "")).border = border
-        ws2.cell(row=i, column=3).alignment = align_left
+    if structure:
+        rows = [
+            [item.get("level", ""), item.get("name", ""), item.get("description", "")]
+            for item in structure
+        ]
+        write_table(ws2, 2, ["层级", "要素名称", "说明"], rows, [15, 35, 50])
+    else:
+        # 占位提示
+        ws2.cell(row=2, column=1, value="（请在 FMEA 团队会议中填写结构树/过程流程图）")
+        ws2.merge_cells("A2:C2")
+        apply_body_style(ws2.cell(row=2, column=1), 1, False)
 
     # ---------- Sheet 3: 功能分析 ----------
     ws3 = wb.create_sheet("3.功能分析")
-    ws3.column_dimensions["A"].width = 15
-    ws3.column_dimensions["B"].width = 25
-    ws3.column_dimensions["C"].width = 55
-
-    ws3.cell(row=1, column=1, value="步骤三：功能分析").font = Font(bold=True, size=14)
-    ws3.merge_cells("A1:C1")
-    ws3.cell(row=1, column=1).fill = header_fill
-    ws3.cell(row=1, column=1).font = header_font
-    ws3.cell(row=1, column=1).alignment = align_center
-
-    headers = ["层级", "要素名称", "功能描述"]
-    for col, h in enumerate(headers, start=1):
-        c = ws3.cell(row=2, column=col, value=h)
-        c.font = header_font
-        c.fill = header_fill
-        c.alignment = align_center
-        c.border = border
+    write_section_title(ws3, 1, "步骤三：功能分析", span_cols=3)
 
     functions = data.get("function_tree", [])
-    for i, item in enumerate(functions, start=3):
-        ws3.cell(row=i, column=1, value=item.get("level", "")).border = border
-        ws3.cell(row=i, column=1).alignment = align_center
-        ws3.cell(row=i, column=2, value=item.get("name", "")).border = border
-        ws3.cell(row=i, column=2).alignment = align_left
-        ws3.cell(row=i, column=3, value=item.get("function", "")).border = border
-        ws3.cell(row=i, column=3).alignment = align_left
+    if functions:
+        rows = [
+            [item.get("level", ""), item.get("name", ""), item.get("function", "")]
+            for item in functions
+        ]
+        write_table(ws3, 2, ["层级", "要素名称", "功能描述"], rows, [15, 25, 55])
+    else:
+        ws3.cell(row=2, column=1, value="（功能定义遵循「主动动词 + 可测量名词」格式）")
+        ws3.merge_cells("A2:C2")
+        apply_body_style(ws3.cell(row=2, column=1), 1, False)
 
     # ---------- Sheet 4: 失效分析 ----------
     ws4 = wb.create_sheet("4.失效分析")
-    ws4.column_dimensions["A"].width = 8
-    ws4.column_dimensions["B"].width = 45
-    ws4.column_dimensions["C"].width = 35
-    ws4.column_dimensions["D"].width = 45
+    write_section_title(ws4, 1, "步骤四：失效分析（失效链 FE→FM→FC）", span_cols=4)
 
-    ws4.cell(row=1, column=1, value="步骤四：失效分析（失效链 FE→FM→FC）").font = Font(bold=True, size=14)
-    ws4.merge_cells("A1:D1")
-    ws4.cell(row=1, column=1).fill = header_fill
-    ws4.cell(row=1, column=1).font = header_font
-    ws4.cell(row=1, column=1).alignment = align_center
-
-    headers = ["序号", "失效影响（FE）", "失效模式（FM）", "失效起因（FC）"]
-    for col, h in enumerate(headers, start=1):
-        c = ws4.cell(row=2, column=col, value=h)
-        c.font = header_font
-        c.fill = header_fill
-        c.alignment = align_center
-        c.border = border
-
-    chains = data.get("failure_chains", [])
-    for i, chain in enumerate(chains, start=3):
-        ws4.cell(row=i, column=1, value=i - 2).border = border
-        ws4.cell(row=i, column=1).alignment = align_center
-        ws4.cell(row=i, column=2, value=chain.get("fe", "")).border = border
-        ws4.cell(row=i, column=2).alignment = align_left
-        ws4.cell(row=i, column=3, value=chain.get("fm", "")).border = border
-        ws4.cell(row=i, column=3).alignment = align_left
-        ws4.cell(row=i, column=4, value=chain.get("fc", "")).border = border
-        ws4.cell(row=i, column=4).alignment = align_left
-        # 自适应行高
-        ws4.row_dimensions[i].height = max(60, len(chain.get("fe", "")) / 2)
+    chain_rows = [
+        [i, c.get("fe", ""), c.get("fm", ""), c.get("fc", "")]
+        for i, c in enumerate(chains, start=1)
+    ]
+    write_table(ws4, 2, ["序号", "失效影响（FE）", "失效模式（FM）", "失效起因（FC）"],
+                chain_rows, [6, 45, 35, 45])
 
     # ---------- Sheet 5: 风险分析 ----------
     ws5 = wb.create_sheet("5.风险分析")
-    col_widths = [6, 30, 25, 35, 35, 6, 6, 6, 6, 8]
-    for i, w in enumerate(col_widths, start=1):
-        ws5.column_dimensions[get_column_letter(i)].width = w
+    write_section_title(ws5, 1, "步骤五：风险分析（S/O/D 评级 + AP + 特殊特性）", span_cols=10)
 
-    ws5.cell(row=1, column=1, value="步骤五：风险分析（S/O/D 评级 + AP）").font = Font(bold=True, size=14)
-    ws5.merge_cells("A1:J1")
-    ws5.cell(row=1, column=1).fill = header_fill
-    ws5.cell(row=1, column=1).font = header_font
-    ws5.cell(row=1, column=1).alignment = align_center
+    risk_rows = []
+    for i, c in enumerate(chains, start=1):
+        s = c.get("s", 5)
+        o = c.get("o", 5)
+        d = c.get("d", 5)
+        ap = c.get("ap", get_ap_priority(s, o, d))
+        sc = get_special_characteristic(s, ap)
+        risk_rows.append([
+            i,
+            c.get("fe", ""),
+            c.get("fm", ""),
+            c.get("pc", ""),
+            c.get("dc", ""),
+            s, o, d, ap, sc,
+        ])
 
-    headers = ["序号", "失效影响（FE）", "失效模式（FM）", "预防控制（PC）", "探测控制（DC）", "S", "O", "D", "AP", "特殊特性"]
-    for col, h in enumerate(headers, start=1):
-        c = ws5.cell(row=2, column=col, value=h)
-        c.font = header_font
-        c.fill = header_fill
-        c.alignment = align_center
-        c.border = border
-
-    for i, chain in enumerate(chains, start=3):
-        s = chain.get("s", 5)
-        o = chain.get("o", 5)
-        d = chain.get("d", 5)
-        ap = chain.get("ap", get_ap_priority(s, o, d))
-
-        ws5.cell(row=i, column=1, value=i - 2).border = border
-        ws5.cell(row=i, column=1).alignment = align_center
-        ws5.cell(row=i, column=2, value=chain.get("fe", "")).border = border
-        ws5.cell(row=i, column=2).alignment = align_left
-        ws5.cell(row=i, column=3, value=chain.get("fm", "")).border = border
-        ws5.cell(row=i, column=3).alignment = align_left
-        ws5.cell(row=i, column=4, value=chain.get("pc", "")).border = border
-        ws5.cell(row=i, column=4).alignment = align_left
-        ws5.cell(row=i, column=5, value=chain.get("dc", "")).border = border
-        ws5.cell(row=i, column=5).alignment = align_left
-        ws5.cell(row=i, column=6, value=s).border = border
-        ws5.cell(row=i, column=6).alignment = align_center
-        ws5.cell(row=i, column=7, value=o).border = border
-        ws5.cell(row=i, column=7).alignment = align_center
-        ws5.cell(row=i, column=8, value=d).border = border
-        ws5.cell(row=i, column=8).alignment = align_center
-
-        ap_cell = ws5.cell(row=i, column=9, value=ap)
-        ap_cell.border = border
-        ap_cell.alignment = align_center
-        ap_cell.font = Font(bold=True)
-        if ap in ap_colors:
-            ap_cell.fill = ap_colors[ap]
-
-        # 特殊特性识别
-        sc = ""
-        if s >= 9:
-            sc = "CC"
-        elif s == 8 and ap in ("H", "M"):
-            sc = "SC"
-        sc_cell = ws5.cell(row=i, column=10, value=sc)
-        sc_cell.border = border
-        sc_cell.alignment = align_center
-        if sc:
-            sc_cell.font = Font(bold=True, color="FF0000")
-
-        ws5.row_dimensions[i].height = max(60, len(chain.get("fe", "")) / 2)
+    write_table(ws5, 2,
+                ["序号", "失效影响（FE）", "失效模式（FM）", "预防控制（PC）", "探测控制（DC）",
+                 "S", "O", "D", "AP", "特殊特性"],
+                risk_rows,
+                [6, 30, 25, 35, 35, 6, 6, 6, 6, 10],
+                ap_col=9,           # AP 列高亮
+                special_char_col=10)  # 特殊特性列高亮
 
     # ---------- Sheet 6: 优化措施 ----------
     ws6 = wb.create_sheet("6.优化措施")
-    col_widths = [6, 30, 12, 50, 15, 15, 12, 8, 8, 8, 8]
-    for i, w in enumerate(col_widths, start=1):
-        ws6.column_dimensions[get_column_letter(i)].width = w
-
-    ws6.cell(row=1, column=1, value="步骤六：优化措施").font = Font(bold=True, size=14)
-    ws6.merge_cells("A1:K1")
-    ws6.cell(row=1, column=1).fill = header_fill
-    ws6.cell(row=1, column=1).font = header_font
-    ws6.cell(row=1, column=1).alignment = align_center
-
-    headers = ["序号", "失效模式", "措施类型", "措施描述", "责任人", "截止日期", "状态", "措施后 S", "措施后 O", "措施后 D", "措施后 AP"]
-    for col, h in enumerate(headers, start=1):
-        c = ws6.cell(row=2, column=col, value=h)
-        c.font = header_font
-        c.fill = header_fill
-        c.alignment = align_center
-        c.border = border
+    write_section_title(ws6, 1, "步骤六：优化措施（PC/DC 改进 + 措施跟踪）", span_cols=11)
 
     measures = data.get("optimization_measures", [])
-    for i, m in enumerate(measures, start=3):
-        ws6.cell(row=i, column=1, value=i - 2).border = border
-        ws6.cell(row=i, column=1).alignment = align_center
-        ws6.cell(row=i, column=2, value=m.get("fm", "")).border = border
-        ws6.cell(row=i, column=2).alignment = align_left
-        ws6.cell(row=i, column=3, value=m.get("type", "")).border = border
-        ws6.cell(row=i, column=3).alignment = align_center
-        ws6.cell(row=i, column=4, value=m.get("description", "")).border = border
-        ws6.cell(row=i, column=4).alignment = align_left
-        ws6.cell(row=i, column=5, value=m.get("owner", "（待指定）")).border = border
-        ws6.cell(row=i, column=5).alignment = align_center
-        ws6.cell(row=i, column=6, value=m.get("due_date", "（待指定）")).border = border
-        ws6.cell(row=i, column=6).alignment = align_center
-        ws6.cell(row=i, column=7, value=m.get("status", "已建议")).border = border
-        ws6.cell(row=i, column=7).alignment = align_center
-        # 措施后 S/O/D/AP（待实施后填写）
-        for col in [8, 9, 10, 11]:
-            ws6.cell(row=i, column=col, value="—").border = border
-            ws6.cell(row=i, column=col).alignment = align_center
+    measure_rows = []
+    for i, m in enumerate(measures, start=1):
+        measure_rows.append([
+            i,
+            m.get("fm", ""),
+            m.get("type", "PC+DC 改进"),
+            m.get("description", ""),
+            m.get("owner", "____"),
+            m.get("due_date", "____"),
+            m.get("status", "已建议"),
+            "—",  # 措施后 S
+            "—",  # 措施后 O
+            "—",  # 措施后 D
+            "—",  # 措施后 AP
+        ])
+
+    write_table(ws6, 2,
+                ["序号", "失效模式", "措施类型", "措施描述", "责任人", "截止日期", "状态",
+                 "措施后 S", "措施后 O", "措施后 D", "措施后 AP"],
+                measure_rows,
+                [6, 30, 12, 50, 12, 14, 12, 9, 9, 9, 10],
+                status_col=7)
 
     # ---------- Sheet 7: 风险矩阵 ----------
     ws7 = wb.create_sheet("7.风险矩阵")
-    ws7.cell(row=1, column=1, value="步骤七：风险矩阵（S×O 热力图）").font = Font(bold=True, size=14)
-    ws7.merge_cells("A1:L1")
-    ws7.cell(row=1, column=1).fill = header_fill
-    ws7.cell(row=1, column=1).font = header_font
-    ws7.cell(row=1, column=1).alignment = align_center
+    write_section_title(ws7, 1, "步骤七：风险矩阵（S×O 热力图 + 风险统计）", span_cols=12)
 
     # S×O 矩阵（10x10）
-    ws7.cell(row=3, column=1, value="S\\O").font = Font(bold=True)
-    ws7.cell(row=3, column=1).fill = PatternFill("solid", fgColor="305496")
-    ws7.cell(row=3, column=1).font = header_font
-    ws7.cell(row=3, column=1).alignment = align_center
-    ws7.cell(row=3, column=1).border = border
+    ws7.cell(row=3, column=1, value="S\\O")
+    apply_header_style(ws7.cell(row=3, column=1))
 
     for o in range(1, 11):
         c = ws7.cell(row=3, column=o + 1, value=o)
-        c.font = header_font
-        c.fill = header_fill
-        c.alignment = align_center
-        c.border = border
+        apply_header_style(c)
 
     for s in range(10, 0, -1):
         row_idx = 14 - s
         c = ws7.cell(row=row_idx, column=1, value=s)
-        c.font = header_font
-        c.fill = header_fill
-        c.alignment = align_center
-        c.border = border
+        apply_header_style(c)
         for o in range(1, 11):
             ap = get_ap_priority(s, o, 5)  # D=5 中位数
             cell = ws7.cell(row=row_idx, column=o + 1, value=ap)
-            cell.alignment = align_center
-            cell.border = border
-            cell.font = Font(bold=True)
-            if ap in ap_colors:
-                cell.fill = ap_colors[ap]
+            apply_ap_style(cell, ap)
 
     # 图例
-    ws7.cell(row=16, column=1, value="图例：").font = Font(bold=True)
-    ws7.cell(row=16, column=2, value="H（高）").fill = ap_colors["H"]
-    ws7.cell(row=16, column=2).alignment = align_center
-    ws7.cell(row=16, column=3, value="M（中）").fill = ap_colors["M"]
-    ws7.cell(row=16, column=3).alignment = align_center
-    ws7.cell(row=16, column=4, value="L（低）").fill = ap_colors["L"]
-    ws7.cell(row=16, column=4).alignment = align_center
+    ws7.cell(row=16, column=1, value="图例：").font = Font(name=FONT_NAME, bold=True)
+    for col, (label, ap) in enumerate([(2, "H"), (3, "M"), (4, "L")], start=2):
+        c = ws7.cell(row=16, column=col, value=f"{label}（{'高' if ap=='H' else '中' if ap=='M' else '低'}）")
+        apply_ap_style(c, ap)
 
     # 风险统计
-    ws7.cell(row=18, column=1, value="风险统计").font = Font(bold=True, size=12)
+    ws7.cell(row=18, column=1, value="风险统计").font = Font(name=FONT_NAME, bold=True, size=12)
     h_count = sum(1 for c in chains if c.get("ap") == "H")
     m_count = sum(1 for c in chains if c.get("ap") == "M")
     l_count = sum(1 for c in chains if c.get("ap") == "L")
@@ -517,10 +1017,25 @@ def create_excel_report(data: dict, output_path: Path):
         ("CC（关键特性，S≥9）", cc_count),
         ("SC（特殊特性，S=8 且 AP=H/M）", sc_count),
     ]
-    for i, (k, v) in enumerate(stats, start=19):
-        ws7.cell(row=i, column=1, value=k).font = Font(bold=True)
-        ws7.cell(row=i, column=2, value=v).alignment = align_center
-        ws7.cell(row=i, column=2).font = Font(bold=True, size=12, color="305496")
+    stats_start = 19
+    for i, (k, v) in enumerate(stats):
+        r = stats_start + i
+        ws7.cell(row=r, column=1, value=k).font = Font(name=FONT_NAME, bold=True)
+        cell = ws7.cell(row=r, column=2, value=v)
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.font = Font(name=FONT_NAME, bold=True, size=12, color=HEADER_FILL)
+
+    # 设置各 Sheet 列宽
+    set_column_widths(ws7, [22] + [6] * 11)
+
+    # ---------- 自动填充 ----------
+    if data.get("auto_fill"):
+        for ws in [ws1, ws2, ws3, ws4, ws5, ws6, ws7]:
+            _apply_auto_fill_xlsx(ws, data.get("fmea_type", ""), data.get("fmea_no", ""))
+
+    # ---------- 行高自动计算 ----------
+    for ws in [ws1, ws2, ws3, ws4, ws5, ws6, ws7]:
+        _recalc_all_row_heights(ws)
 
     # 保存
     wb.save(output_path)
@@ -531,185 +1046,363 @@ def create_excel_report(data: dict, output_path: Path):
 # Word 生成
 # ============================================================
 
+# Word 字体辅助函数
+def set_cell_bg(cell, color_hex):
+    """设置 Word 表格单元格背景色。"""
+    from docx.oxml import OxmlElement
+    tc_pr = cell._tc.get_or_add_tcPr()
+    shd = OxmlElement('w:shd')
+    shd.set(qn('w:val'), 'clear')
+    shd.set(qn('w:color'), 'auto')
+    shd.set(qn('w:fill'), color_hex)
+    tc_pr.append(shd)
+
+
+def set_cell_borders(cell):
+    """设置 Word 表格单元格四边边框。"""
+    from docx.oxml import OxmlElement
+    tc_pr = cell._tc.get_or_add_tcPr()
+    tc_borders = OxmlElement('w:tcBorders')
+    for edge in ('top', 'left', 'bottom', 'right'):
+        border = OxmlElement(f'w:{edge}')
+        border.set(qn('w:val'), 'single')
+        border.set(qn('w:sz'), '4')
+        border.set(qn('w:color'), '808080')
+        tc_borders.append(border)
+    tc_pr.append(tc_borders)
+
+
+def set_run_font(run, font_name=FONT_NAME, size=10.5, bold=False, color=None):
+    """设置 Word run 的字体属性。"""
+    run.font.name = font_name
+    run.font.size = Pt(size)
+    run.bold = bold
+    if color:
+        run.font.color.rgb = RGBColor.from_string(color)
+    # 设置中文字体
+    r_pr = run._element.get_or_add_rPr()
+    r_fonts = r_pr.find(qn('w:rFonts'))
+    if r_fonts is None:
+        from docx.oxml import OxmlElement
+        r_fonts = OxmlElement('w:rFonts')
+        r_pr.insert(0, r_fonts)
+    r_fonts.set(qn('w:eastAsia'), font_name)
+
+
+def add_paragraph(doc, text, bold=False, size=10.5, color=None, alignment=None, indent=False):
+    """添加段落。"""
+    p = doc.add_paragraph()
+    if alignment:
+        p.alignment = alignment
+    if indent:
+        p.paragraph_format.left_indent = Cm(0.5)
+    run = p.add_run(text)
+    set_run_font(run, size=size, bold=bold, color=color)
+    return p
+
+
+def add_heading(doc, text, level=1):
+    """添加标题。"""
+    h = doc.add_heading(level=level)
+    run = h.add_run(text)
+    size_map = {0: 22, 1: 16, 2: 13, 3: 11}
+    set_run_font(run, size=size_map.get(level, 11), bold=True, color=HEADER_FILL)
+    return h
+
+
+def add_table(doc, headers, rows, col_widths_cm=None,
+              ap_col=None, special_char_col=None, status_col=None):
+    """添加表格（支持 AP/特殊特性/状态列高亮）。
+
+    Args:
+        doc: Document 对象
+        headers: 表头列表
+        rows: 数据行列表
+        col_widths_cm: 列宽（厘米）列表
+        ap_col: AP 列的 1-indexed 位置
+        special_char_col: 特殊特性列的 1-indexed 位置
+        status_col: 状态列的 1-indexed 位置
+    """
+    table = doc.add_table(rows=1 + len(rows), cols=len(headers))
+    table.alignment = WD_TABLE_ALIGNMENT.CENTER
+    table.style = "Table Grid"
+
+    # 设置列宽
+    if col_widths_cm:
+        for i, w in enumerate(col_widths_cm):
+            for cell in table.columns[i].cells:
+                cell.width = Cm(w)
+
+    # 写表头
+    hdr = table.rows[0].cells
+    for i, h in enumerate(headers):
+        # 清空原段落
+        for p in hdr[i].paragraphs:
+            for r in p.runs:
+                r.text = ""
+        run = hdr[i].paragraphs[0].add_run(h)
+        set_run_font(run, size=10.5, bold=True, color="FFFFFF")
+        set_cell_bg(hdr[i], HEADER_FILL)
+        set_cell_borders(hdr[i])
+        hdr[i].paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    # 写数据行
+    for row_idx, row_data in enumerate(rows, start=1):
+        is_alt = (row_idx % 2 == 1)
+        cells = table.rows[row_idx].cells
+        for col_idx, value in enumerate(row_data, start=1):
+            value_str = str(value) if value is not None else ""
+            cell = cells[col_idx - 1]
+            for p in cell.paragraphs:
+                for r in p.runs:
+                    r.text = ""
+            run = cell.paragraphs[0].add_run(value_str)
+
+            # 按列类型应用样式
+            if ap_col and col_idx == ap_col:
+                set_run_font(run, size=11, bold=True, color="000000")
+                ap_val = value_str
+                if ap_val == "H":
+                    set_cell_bg(cell, AP_H_FILL)
+                elif ap_val == "M":
+                    set_cell_bg(cell, AP_M_FILL)
+                elif ap_val == "L":
+                    set_cell_bg(cell, AP_L_FILL)
+                cell.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
+            elif special_char_col and col_idx == special_char_col:
+                if value_str:
+                    set_run_font(run, size=10.5, bold=True, color="C00000")
+                    if value_str == "CC":
+                        set_cell_bg(cell, CC_FILL)
+                    elif value_str == "SC":
+                        set_cell_bg(cell, SC_FILL)
+                else:
+                    set_run_font(run, size=10.5)
+                cell.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
+            elif status_col and col_idx == status_col:
+                set_run_font(run, size=10.5)
+                if value_str in ("已实施", "已关闭", "已完成"):
+                    set_cell_bg(cell, STATUS_DONE_FILL)
+                elif value_str in ("已建议", "已决策", "进行中"):
+                    set_cell_bg(cell, STATUS_OPEN_FILL)
+                cell.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
+            else:
+                set_run_font(run, size=10.5)
+                if is_alt:
+                    set_cell_bg(cell, ALT_ROW_FILL)
+                cell.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.LEFT
+
+            set_cell_borders(cell)
+
+    return table
+
+
+def add_kv_table(doc, kv_pairs, label_width_cm=4.5, value_width_cm=12):
+    """添加键值对表格（左侧标签 + 右侧值）。"""
+    table = doc.add_table(rows=len(kv_pairs), cols=2)
+    table.alignment = WD_TABLE_ALIGNMENT.CENTER
+    table.style = "Table Grid"
+
+    for i, (k, v) in enumerate(kv_pairs):
+        cells = table.rows[i].cells
+        cells[0].width = Cm(label_width_cm)
+        cells[1].width = Cm(value_width_cm)
+
+        # 标签
+        for p in cells[0].paragraphs:
+            for r in p.runs:
+                r.text = ""
+        run = cells[0].paragraphs[0].add_run(k)
+        set_run_font(run, size=10.5, bold=True, color="FFFFFF")
+        set_cell_bg(cells[0], SUBHEADER_FILL)
+        set_cell_borders(cells[0])
+
+        # 值
+        for p in cells[1].paragraphs:
+            for r in p.runs:
+                r.text = ""
+        run = cells[1].paragraphs[0].add_run(str(v))
+        set_run_font(run, size=10.5)
+        if i % 2 == 1:
+            set_cell_bg(cells[1], ALT_ROW_FILL)
+        set_cell_borders(cells[1])
+
+    return table
+
+
+def set_doc_default_font(doc):
+    """设置文档默认字体为微软雅黑。"""
+    style = doc.styles["Normal"]
+    style.font.name = FONT_NAME
+    style.font.size = Pt(10.5)
+    style.element.rPr.rFonts.set(qn("w:eastAsia"), FONT_NAME)
+
+
+def set_page_header(doc, fmea_no):
+    """设置页眉显示 FMEA 编号。"""
+    section = doc.sections[0]
+    header = section.header
+    p = header.paragraphs[0]
+    p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    run = p.add_run(f"FMEA 编号：{fmea_no}")
+    set_run_font(run, size=9, color="808080")
+
+
 def create_docx_report(data: dict, output_path: Path):
     """生成 FMEA Word 报告（7 章）。"""
     doc = Document()
+    set_doc_default_font(doc)
 
-    # 设置默认字体
-    style = doc.styles["Normal"]
-    style.font.name = "宋体"
-    style.font.size = Pt(10.5)
-    style.element.rPr.rFonts.set(qn("w:eastAsia"), "宋体")
+    fmea_type = data.get("fmea_type", "FMEA")
+    fmea_no = data.get("fmea_no", f"FMEA-{datetime.date.today().strftime('%Y%m%d')}-001")
+    set_page_header(doc, fmea_no)
 
     # 标题
-    title = doc.add_heading(f"{data.get('fmea_type', 'FMEA')} 分析报告", level=0)
+    title = doc.add_heading(level=0)
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run = title.add_run(f"{fmea_type} 分析报告")
+    set_run_font(run, size=22, bold=True, color=HEADER_FILL)
 
     # 副标题
     sub = doc.add_paragraph()
     sub.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    run = sub.add_run(f"产品：{data.get('product_name', '')}\n客户：{data.get('customer', '')}\n日期：{datetime.date.today().isoformat()}")
-    run.font.size = Pt(11)
+    run = sub.add_run(
+        f"产品：{data.get('product_name', '')}\n"
+        f"客户：{data.get('customer', '')}\n"
+        f"日期：{datetime.date.today().isoformat()}"
+    )
+    set_run_font(run, size=11)
 
     doc.add_paragraph()
 
-    # ---------- 第 1 章：概述 ----------
-    doc.add_heading("第一章 概述", level=1)
+    chains = data.get("failure_chains", [])
 
-    doc.add_paragraph(
+    # ---------- 第 1 章：概述 ----------
+    add_heading(doc, "第一章 概述", level=1)
+
+    add_paragraph(doc,
         f"本报告基于 AIAG & VDA FMEA 手册（2019 版）七步法编制，覆盖"
-        f"{data.get('fmea_type', '')} 分析的全过程。分析对象为"
+        f"{fmea_type} 分析的全过程。分析对象为"
         f"{data.get('product_name', '')}，涉及客户 {data.get('customer', '')}。"
     )
 
-    p = doc.add_paragraph()
-    p.add_run("项目基本信息：").bold = True
-
-    info_table = doc.add_table(rows=8, cols=2)
-    info_table.style = "Light Grid Accent 1"
-    info_table.alignment = WD_TABLE_ALIGNMENT.CENTER
+    add_paragraph(doc, "项目基本信息：", bold=True)
 
     info_items = [
-        ("FMEA 类型", data.get("fmea_type", "")),
+        ("FMEA 类型", fmea_type),
         ("产品名称", data.get("product_name", "")),
         ("客户名称", data.get("customer", "")),
         ("项目编号", data.get("project_no", "（待填写）")),
         ("系统层级", data.get("system_level", "—")),
         ("工艺名称", data.get("process_name", "—")),
         ("团队成员", data.get("team_members", "（待填写）")),
-        ("FMEA 编号", data.get("fmea_no", f"FMEA-{datetime.date.today().strftime('%Y%m%d')}-001")),
+        ("FMEA 编号", fmea_no),
+        ("FMEA 编制人", data.get("preparer", "（待填写）")),
+        ("FMEA 审核人", data.get("reviewer", "（待填写）")),
+        ("FMEA 批准人", data.get("approver", "（待填写）")),
     ]
+    add_kv_table(doc, info_items, label_width_cm=4.5, value_width_cm=12)
 
-    for i, (k, v) in enumerate(info_items):
-        info_table.cell(i, 0).text = k
-        info_table.cell(i, 1).text = str(v)
-        info_table.cell(i, 0).paragraphs[0].runs[0].bold = True if info_table.cell(i, 0).paragraphs[0].runs else False
-
-    doc.add_paragraph()
-    p = doc.add_paragraph()
-    p.add_run("参考标准：").bold = True
-    p.add_run("AIAG & VDA FMEA Handbook 2019、IATF 16949:2016")
+    add_paragraph(doc, "")
+    add_paragraph(doc, "参考标准：", bold=True)
+    add_paragraph(doc, "AIAG & VDA FMEA Handbook 2019、IATF 16949:2016", indent=True)
 
     # ---------- 第 2 章：结构分析 ----------
-    doc.add_heading("第二章 结构分析", level=1)
+    add_heading(doc, "第二章 结构分析", level=1)
 
-    doc.add_paragraph(
+    add_paragraph(doc,
         "结构分析将分析对象分解为可视化的结构，识别系统要素及其相互关系。"
         "本步骤为后续功能分析和失效分析提供基础。"
     )
 
     structure = data.get("structure_tree", [])
     if structure:
-        doc.add_paragraph("结构树：")
+        add_paragraph(doc, "结构树：")
         for item in structure:
             indent = "  " * (int(item.get("level_indent", 0)) or 0)
-            doc.add_paragraph(f"{indent}• {item.get('name', '')}：{item.get('description', '')}")
+            add_paragraph(doc, f"{indent}• {item.get('name', '')}：{item.get('description', '')}", indent=True)
+    else:
+        add_paragraph(doc,
+            "（结构分析需在 FMEA 团队会议中填写结构树/过程流程图。"
+            "DFMEA 使用结构树或方块图，PFMEA 使用过程流程图 + 4M1E 工作要素。）",
+            indent=True
+        )
 
     # ---------- 第 3 章：功能分析 ----------
-    doc.add_heading("第三章 功能分析", level=1)
+    add_heading(doc, "第三章 功能分析", level=1)
 
-    doc.add_paragraph(
+    add_paragraph(doc,
         "功能分析明确每个系统要素/工序的功能及其要求。"
         "功能的完整定义会使失效分析更全面。功能定义遵循「主动动词 + 可测量名词」的格式。"
     )
 
     functions = data.get("function_tree", [])
     if functions:
-        doc.add_paragraph("功能清单：")
-        func_table = doc.add_table(rows=1 + len(functions), cols=3)
-        func_table.style = "Light Grid Accent 1"
-        func_table.alignment = WD_TABLE_ALIGNMENT.CENTER
-
-        hdr = func_table.rows[0].cells
-        hdr[0].text = "层级"
-        hdr[1].text = "要素名称"
-        hdr[2].text = "功能描述"
-        for c in hdr:
-            for p in c.paragraphs:
-                for r in p.runs:
-                    r.bold = True
-
-        for i, item in enumerate(functions, start=1):
-            func_table.cell(i, 0).text = str(item.get("level", ""))
-            func_table.cell(i, 1).text = str(item.get("name", ""))
-            func_table.cell(i, 2).text = str(item.get("function", ""))
+        add_paragraph(doc, "功能清单：")
+        func_rows = [
+            [item.get("level", ""), item.get("name", ""), item.get("function", "")]
+            for item in functions
+        ]
+        add_table(doc, ["层级", "要素名称", "功能描述"], func_rows,
+                  col_widths_cm=[2.5, 4, 9])
+    else:
+        add_paragraph(doc,
+            "（功能分析应在结构分析基础上展开。"
+            "DFMEA 使用功能树或参数图（P-图），PFMEA 使用过程功能分析。）",
+            indent=True
+        )
 
     # ---------- 第 4 章：失效分析 ----------
-    doc.add_heading("第四章 失效分析", level=1)
+    add_heading(doc, "第四章 失效分析", level=1)
 
-    doc.add_paragraph(
+    add_paragraph(doc,
         "失效分析识别每个功能的潜在失效影响（FE）、失效模式（FM）和失效起因（FC），"
         "形成失效链 FE→FM→FC。失效模式包括 7 种类型：功能丧失、功能退化、功能间歇、"
         "部分功能丧失、非预期功能、功能超范围、功能延迟。"
     )
 
-    chains = data.get("failure_chains", [])
     if chains:
-        doc.add_paragraph(f"共识别 {len(chains)} 条失效链：")
+        add_paragraph(doc, f"共识别 {len(chains)} 条失效链：")
 
-        for i, chain in enumerate(chains, start=1):
-            doc.add_heading(f"失效链 #{i}", level=2)
-
-            t = doc.add_table(rows=3, cols=2)
-            t.style = "Light Grid Accent 1"
-            t.cell(0, 0).text = "失效影响（FE）"
-            t.cell(0, 1).text = chain.get("fe", "")
-            t.cell(1, 0).text = "失效模式（FM）"
-            t.cell(1, 1).text = chain.get("fm", "")
-            t.cell(2, 0).text = "失效起因（FC）"
-            t.cell(2, 1).text = chain.get("fc", "")
-
-            for r in t.rows:
-                r.cells[0].paragraphs[0].runs[0].bold = True if r.cells[0].paragraphs[0].runs else False
+        chain_rows = [
+            [i, c.get("fe", ""), c.get("fm", ""), c.get("fc", "")]
+            for i, c in enumerate(chains, start=1)
+        ]
+        add_table(doc, ["序号", "失效影响（FE）", "失效模式（FM）", "失效起因（FC）"],
+                  chain_rows, col_widths_cm=[1.5, 5.5, 4.5, 5.5])
 
     # ---------- 第 5 章：风险分析 ----------
-    doc.add_heading("第五章 风险分析", level=1)
+    add_heading(doc, "第五章 风险分析", level=1)
 
-    doc.add_paragraph(
+    add_paragraph(doc,
         "风险分析通过评估严重度（S）、频度（O）、探测度（D）来估计风险，"
         "并基于 2019 版 AP 行动优先级矩阵判定 H/M/L 三档优先级。"
         "本步骤不再使用 RPN（=S×O×D），改用 AP 矩阵。"
     )
 
+    h_count = m_count = l_count = cc_count = sc_count = 0
     if chains:
-        doc.add_paragraph("风险评级表：")
+        add_paragraph(doc, "风险评级表：")
 
-        risk_table = doc.add_table(rows=1 + len(chains), cols=7)
-        risk_table.style = "Light Grid Accent 1"
-        risk_table.alignment = WD_TABLE_ALIGNMENT.CENTER
+        risk_rows = []
+        for i, c in enumerate(chains, start=1):
+            s = c.get("s", 5)
+            o = c.get("o", 5)
+            d = c.get("d", 5)
+            ap = c.get("ap", get_ap_priority(s, o, d))
+            sc = get_special_characteristic(s, ap)
+            risk_rows.append([
+                i, c.get("fm", ""), s, o, d, ap, sc
+            ])
 
-        hdr = risk_table.rows[0].cells
-        headers = ["序号", "失效模式", "S", "O", "D", "AP", "特殊特性"]
-        for i, h in enumerate(headers):
-            hdr[i].text = h
-            for p in hdr[i].paragraphs:
-                for r in p.runs:
-                    r.bold = True
-
-        for i, chain in enumerate(chains, start=1):
-            s = chain.get("s", 5)
-            o = chain.get("o", 5)
-            d = chain.get("d", 5)
-            ap = chain.get("ap", get_ap_priority(s, o, d))
-
-            sc = ""
-            if s >= 9:
-                sc = "CC"
-            elif s == 8 and ap in ("H", "M"):
-                sc = "SC"
-
-            risk_table.cell(i, 0).text = str(i)
-            risk_table.cell(i, 1).text = chain.get("fm", "")
-            risk_table.cell(i, 2).text = str(s)
-            risk_table.cell(i, 3).text = str(o)
-            risk_table.cell(i, 4).text = str(d)
-            risk_table.cell(i, 5).text = ap
-            risk_table.cell(i, 6).text = sc
+        add_table(doc, ["序号", "失效模式", "S", "O", "D", "AP", "特殊特性"],
+                  risk_rows,
+                  col_widths_cm=[1.5, 5, 1.2, 1.2, 1.2, 1.5, 2],
+                  ap_col=6, special_char_col=7)
 
         # 风险统计
-        doc.add_paragraph()
-        p = doc.add_paragraph()
-        p.add_run("风险统计：").bold = True
+        add_paragraph(doc, "")
+        add_paragraph(doc, "风险统计：", bold=True)
 
         h_count = sum(1 for c in chains if c.get("ap") == "H")
         m_count = sum(1 for c in chains if c.get("ap") == "M")
@@ -717,59 +1410,75 @@ def create_docx_report(data: dict, output_path: Path):
         cc_count = sum(1 for c in chains if c.get("s", 0) >= 9)
         sc_count = sum(1 for c in chains if c.get("s", 0) == 8 and c.get("ap") in ("H", "M"))
 
-        doc.add_paragraph(f"• 失效链总数：{len(chains)}")
-        doc.add_paragraph(f"• AP=H（高优先级）：{h_count} 项")
-        doc.add_paragraph(f"• AP=M（中优先级）：{m_count} 项")
-        doc.add_paragraph(f"• AP=L（低优先级）：{l_count} 项")
-        doc.add_paragraph(f"• CC（关键特性，S≥9）：{cc_count} 项")
-        doc.add_paragraph(f"• SC（特殊特性，S=8 且 AP=H/M）：{sc_count} 项")
+        stats = [
+            f"失效链总数：{len(chains)}",
+            f"AP=H（高优先级）：{h_count} 项",
+            f"AP=M（中优先级）：{m_count} 项",
+            f"AP=L（低优先级）：{l_count} 项",
+            f"CC（关键特性，S≥9）：{cc_count} 项",
+            f"SC（特殊特性，S=8 且 AP=H/M）：{sc_count} 项",
+        ]
+        for s in stats:
+            add_paragraph(doc, f"• {s}", indent=True)
 
     # ---------- 第 6 章：优化措施 ----------
-    doc.add_heading("第六章 优化措施", level=1)
+    add_heading(doc, "第六章 优化措施", level=1)
 
-    doc.add_paragraph(
+    add_paragraph(doc,
         "优化措施分为三类：预防控制（PC）改进、探测控制（DC）改进、设计/过程变更。"
         "对于 S=9-10 且 AP=H/M 的失效影响，建议至少由管理层评审。"
     )
 
     measures = data.get("optimization_measures", [])
     if measures:
-        doc.add_paragraph(f"共 {len(measures)} 项优化措施：")
+        add_paragraph(doc, f"共 {len(measures)} 项优化措施：")
 
-        m_table = doc.add_table(rows=1 + len(measures), cols=5)
-        m_table.style = "Light Grid Accent 1"
-        m_table.alignment = WD_TABLE_ALIGNMENT.CENTER
-
-        hdr = m_table.rows[0].cells
-        headers = ["序号", "措施类型", "措施描述", "责任人", "截止日期"]
-        for i, h in enumerate(headers):
-            hdr[i].text = h
-            for p in hdr[i].paragraphs:
-                for r in p.runs:
-                    r.bold = True
-
+        measure_rows = []
         for i, m in enumerate(measures, start=1):
-            m_table.cell(i, 0).text = str(i)
-            m_table.cell(i, 1).text = m.get("type", "")
-            m_table.cell(i, 2).text = m.get("description", "")
-            m_table.cell(i, 3).text = m.get("owner", "（待指定）")
-            m_table.cell(i, 4).text = m.get("due_date", "（待指定）")
+            measure_rows.append([
+                i,
+                m.get("type", "PC+DC 改进"),
+                m.get("description", ""),
+                m.get("owner", "（待指定）"),
+                m.get("due_date", "（待指定）"),
+                m.get("status", "已建议"),
+            ])
+
+        add_table(doc, ["序号", "措施类型", "措施描述", "责任人", "截止日期", "状态"],
+                  measure_rows,
+                  col_widths_cm=[1.5, 2.5, 5.5, 2, 2.5, 2],
+                  status_col=6)
 
     # ---------- 第 7 章：结论与建议 ----------
-    doc.add_heading("第七章 结论与建议", level=1)
+    add_heading(doc, "第七章 结论与建议", level=1)
 
-    doc.add_paragraph(
-        "本 FMEA 分析基于 AIAG & VDA FMEA 手册（2019 版）七步法编制，"
+    add_paragraph(doc,
+        f"本 FMEA 分析基于 AIAG & VDA FMEA 手册（2019 版）七步法编制，"
         f"共识别 {len(chains)} 条失效链，其中高优先级（AP=H）{h_count} 项、"
         f"中优先级（AP=M）{m_count} 项、低优先级（AP=L）{l_count} 项。"
     )
 
-    doc.add_paragraph("建议：")
-    doc.add_paragraph("1. 优先处理 AP=H 的失效链，制定详细措施并跟踪实施；")
-    doc.add_paragraph("2. 对于 S=9-10 的失效影响（CC 关键特性），必须由管理层评审；")
-    doc.add_paragraph("3. 将识别出的 CC/SC 同步到控制计划（CP）；")
-    doc.add_paragraph("4. 措施实施后重新评估 S/O/D，验证 AP 是否降低；")
-    doc.add_paragraph("5. FMEA 文档应定期评审和更新，特别是在产品设计/工艺变更时。")
+    add_paragraph(doc, "建议：")
+    add_paragraph(doc, "1. 优先处理 AP=H 的失效链，制定详细措施并跟踪实施；", indent=True)
+    add_paragraph(doc, "2. 对于 S=9-10 的失效影响（CC 关键特性），必须由管理层评审；", indent=True)
+    add_paragraph(doc, "3. 将识别出的 CC/SC 同步到控制计划（CP）；", indent=True)
+    add_paragraph(doc, "4. 措施实施后重新评估 S/O/D，验证 AP 是否降低；", indent=True)
+    add_paragraph(doc, "5. FMEA 文档应定期评审和更新，特别是在产品设计/工艺变更时。", indent=True)
+
+    # 签名栏
+    add_paragraph(doc, "")
+    add_paragraph(doc, "签名栏：", bold=True)
+    sign_rows = [
+        ["编制（FMEA 推进者）", "____", "____", "____"],
+        ["审核（质量经理）", "____", "____", "____"],
+        ["批准（项目经理）", "____", "____", "____"],
+    ]
+    add_table(doc, ["角色", "姓名", "签名", "日期"], sign_rows,
+              col_widths_cm=[5, 3, 3, 3])
+
+    # ---------- 自动填充 ----------
+    if data.get("auto_fill"):
+        _apply_auto_fill_word(doc, fmea_type, fmea_no)
 
     # 保存
     doc.save(output_path)
@@ -777,10 +1486,10 @@ def create_docx_report(data: dict, output_path: Path):
 
 
 # ============================================================
-# 主流程
+# 主入口
 # ============================================================
 
-def main():
+def parse_args():
     parser = argparse.ArgumentParser(description="PFMEA/DFMEA 报告生成器")
     parser.add_argument("--fmea-type", required=True, choices=["DFMEA", "PFMEA"], help="FMEA 类型")
     parser.add_argument("--product", required=True, help="产品名称")
@@ -793,11 +1502,14 @@ def main():
     parser.add_argument("--manufacturing-site", default="", help="制造地址（PFMEA）")
     parser.add_argument("--team", default="", help="团队成员")
     parser.add_argument("--template", default="generic-fmea", help="模板 slug")
-    parser.add_argument("--auto-fill", action="store_true", help="自动填充 S/O/D 评分")
+    parser.add_argument("--auto-fill", action="store_true", help="自动填充示例值（S/O/D/责任人/日期等）")
     parser.add_argument("--output-dir", default=".", help="输出目录")
     parser.add_argument("--failure-chains-json", default="", help="自定义失效链 JSON 文件路径")
+    return parser.parse_args()
 
-    args = parser.parse_args()
+
+def main():
+    args = parse_args()
 
     # 模板目录（脚本所在目录的上级 templates/）
     script_dir = Path(__file__).resolve().parent
@@ -821,10 +1533,7 @@ def main():
             chains = json.load(f)
 
     # 占位符替换
-    chains = [
-        {k: substitute_placeholders(v, context) if isinstance(v, str) else v for k, v in c.items()}
-        for c in chains
-    ]
+    chains = substitute_placeholders_deep(chains, context)
 
     # 自动填充
     if args.auto_fill:
@@ -842,19 +1551,34 @@ def main():
                 c["d"] = d
                 c["ap"] = c.get("ap_hint") or get_ap_priority(s, o, d)
 
+    # SOD 一致性检查（仅警告，不阻止生成）
+    warnings_count = 0
+    for i, c in enumerate(chains, start=1):
+        warnings = check_sod_consistency(c)
+        if warnings:
+            warnings_count += len(warnings)
+            for w in warnings:
+                print(f"[WARN] 失效链 #{i}: {w}")
+
     # 构建报告数据
+    fmea_no = f"FMEA-{datetime.date.today().strftime('%Y%m%d')}-001"
     data = {
         "fmea_type": args.fmea_type,
-        "company": "（待填写）",
+        "company": "____",
         "customer": args.customer,
         "product_name": args.product,
-        "project_no": args.project_no,
+        "project_no": args.project_no or "____",
         "system_level": args.system_level,
         "design_responsibility": args.design_responsibility,
         "process_name": args.process_name,
-        "manufacturing_site": args.manufacturing_site,
-        "team_members": args.team,
+        "manufacturing_site": args.manufacturing_site or "____",
+        "team_members": args.team or "____",
         "template": args.template,
+        "fmea_no": fmea_no,
+        "preparer": "____",
+        "reviewer": "____",
+        "approver": "____",
+        "auto_fill": args.auto_fill,
         "structure_tree": [],  # 可扩展：从模板提取
         "function_tree": [],   # 可扩展：从模板提取
         "failure_chains": chains,
@@ -863,8 +1587,8 @@ def main():
                 "fm": c.get("fm", ""),
                 "type": "PC+DC 改进",
                 "description": c.get("pc", "") + " | " + c.get("dc", ""),
-                "owner": "（待指定）",
-                "due_date": "（待指定）",
+                "owner": "____",
+                "due_date": "____",
                 "status": "已建议",
             }
             for c in chains
@@ -893,6 +1617,10 @@ def main():
     m_count = sum(1 for c in chains if c.get("ap") == "M")
     l_count = sum(1 for c in chains if c.get("ap") == "L")
     print(f"  AP=H: {h_count}  AP=M: {m_count}  AP=L: {l_count}")
+    if warnings_count:
+        print(f"  ⚠️  SOD 一致性警告: {warnings_count} 条（详见上方 [WARN]）")
+    if args.auto_fill:
+        print(f"  ✨ 已启用 auto_fill：表头/团队/优化措施表的 ____ 已自动填充示例值")
 
 
 if __name__ == "__main__":
