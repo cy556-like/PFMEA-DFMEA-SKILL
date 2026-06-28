@@ -1,6 +1,79 @@
 # 变更记录
 
+## [2.0.4] - 2026-06-28
+
+### 修复：优化措施表内容与对话不一致
+
+**问题背景**：用户反馈"聊天框输出的优化措施表和生成的文件不一致"。
+- 对话中 Agent 推演了具体措施（① 优化焊缝R角≥8mm ② 增加焊缝疲劳仿真验证）、责任人（设计主管）、截止日期（D+30天）、措施后 S/O/D/AP（10→10/4→3/4→3/H→M）
+- 但文件中的优化措施表用的是模板预填的 pc+dc 拼接（焊接接头设计规范 + 疲劳CAE仿真分析），责任人是 ____，措施后是 —
+
+**根本原因**：`failure_chains` 参数不支持优化措施字段，脚本的 `optimization_measures` 是从 chains 的 pc/dc 字段自动拼接生成的，与 Agent 推演的具体措施完全脱节。
+
+### 修复内容
+
+#### 1. 扩展 failure_chains 参数支持优化措施字段
+
+每条失效链现在支持以下新字段（全部可选，但强烈推荐填写）：
+- `measure_type`: 措施类型（"PC+DC 改进" / "PC 改进" / "DC 改进"）
+- `measure_desc`: 措施描述（① ② ③ 具体内容）
+- `measure_owner`: 责任人（如"设计主管""焊接工程师"）
+- `measure_due_date`: 截止日期（如"D+30天""2026-07-28"）
+- `post_s` / `post_o` / `post_d`: 措施后 S/O/D 评分（1-10 整数）
+- `post_ap`: 措施后 AP（H/M/L）
+
+#### 2. 修改 generate_fmea.py 三处
+
+**main() 函数**：`optimization_measures` 从 chains 提取新字段，优先用 Agent 推演值，缺失时才用模板预填值兜底：
+```python
+"optimization_measures": [
+    {
+        "fm": c.get("fm", ""),
+        "type": c.get("measure_type") or (根据 pc/dc 推断),
+        "description": c.get("measure_desc") or (pc + " | " + dc),
+        "owner": c.get("measure_owner") or "____",
+        "due_date": c.get("measure_due_date") or "____",
+        "status": "已建议",
+        "post_s": c.get("post_s") or "—",
+        "post_o": c.get("post_o") or "—",
+        "post_d": c.get("post_d") or "—",
+        "post_ap": c.get("post_ap") or "—",
+    }
+    for c in chains if c.get("ap") in ("H", "M")
+],
+```
+
+**create_excel_report()**：优化措施表的"措施后 S/O/D/AP"列从固定 "—" 改为 `m.get("post_s", "—")` 等，使用 Agent 推演值。
+
+**create_docx_report()**：同样修改，确保 xlsx 和 docx 内容一致。
+
+#### 3. 修改 JLAGENT 的 tools.py 和 prompts.py
+
+**tools.py**：`failure_chains` 参数 docstring 增加 8 个新字段的详细说明，标注"强烈推荐填写"。
+
+**prompts.py**：硬约束新增第 4 条"优化措施字段必须一起传入"，明确列出 8 个字段名，并提供正确示例（含优化措施字段）和错误示例（不传优化措施字段会导致文件与对话不一致）。
+
+### 实测验证
+
+用用户提供的对话数据（4 条失效链 + 优化措施）测试，文件中的优化措施表与对话完全一致：
+
+| 序号 | 措施类型 | 措施描述 | 责任人 | 截止日期 | 措施后 S/O/D/AP |
+|---|---|---|---|---|---|
+| 1 | PC+DC 改进 | ① 优化焊缝R角≥8mm ② 增加焊缝疲劳仿真验证 ③ 增加100%焊缝磁粉探伤 | 设计主管 | D+30天 | 10/3/3/M |
+| 2 | PC 改进 | ① 优化焊接顺序 ② 设计反变形工装 ③ 增加焊接热输入SPC监控 | 焊接工程师 | D+21天 | 7/3/4/L |
+| 3 | PC+DC 改进 | ① 管梁壁厚增加0.5mm ② 改用S420MC高强钢 ③ 应力集中区域增加加强板 ④ 增加疲劳CAE复算 | 设计主管 | D+45天 | 10/2/3/M |
+| 4 | PC 改进 | ① 安装点增加双层加强板 ② 增加接触面积 ③ 优化衬套座结构 ④ 设计评审 | 结构设计 | D+21天 | 7/3/4/L |
+
+### 兼容性
+
+- 完全向后兼容：不传新字段时，脚本用模板预填值兜底（与 v2.0.3 行为一致）
+- 旧格式 failure_chains（只有 fe/fm/fc/s/o/d/ap/pc/dc）仍然可用
+- xlsx 和 docx 内容一致
+
+---
+
 ## [2.0.3] - 2026-06-28
+
 
 ### 修复：xlsx 改为单 Sheet（与 8D 报告保持一致）
 

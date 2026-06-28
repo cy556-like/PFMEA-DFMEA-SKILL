@@ -1100,10 +1100,11 @@ def create_excel_report(data: dict, output_path: Path):
             ws.cell(row=current_row, column=5, value=m.get("owner", "____"))
             ws.cell(row=current_row, column=6, value=m.get("due_date", "____"))
             ws.cell(row=current_row, column=7, value=m.get("status", "已建议"))
-            ws.cell(row=current_row, column=8, value="—")
-            ws.cell(row=current_row, column=9, value="—")
-            ws.cell(row=current_row, column=10, value="—")
-            ws.cell(row=current_row, column=11, value="—")
+            # 措施后 S/O/D/AP：用 Agent 推演的值（post_s/post_o/post_d/post_ap），缺失时填 "—"
+            ws.cell(row=current_row, column=8, value=m.get("post_s", "—"))
+            ws.cell(row=current_row, column=9, value=m.get("post_o", "—"))
+            ws.cell(row=current_row, column=10, value=m.get("post_d", "—"))
+            ws.cell(row=current_row, column=11, value=m.get("post_ap", "—"))
 
             for col in range(1, 12):
                 cell = ws.cell(row=current_row, column=col)
@@ -1576,10 +1577,10 @@ def create_docx_report(data: dict, output_path: Path):
                 m.get("owner", ""),
                 m.get("due_date", ""),
                 m.get("status", "已建议"),
-                "—",  # 措施后 S
-                "—",  # 措施后 O
-                "—",  # 措施后 D
-                "—",  # 措施后 AP
+                m.get("post_s", "—"),   # 措施后 S（用 Agent 推演值）
+                m.get("post_o", "—"),   # 措施后 O
+                m.get("post_d", "—"),   # 措施后 D
+                m.get("post_ap", "—"),  # 措施后 AP
             ])
         add_table(doc,
                   ["序号", "失效模式", "措施类型", "措施描述", "责任人", "截止日期", "状态",
@@ -1748,11 +1749,24 @@ def main():
         "optimization_measures": [
             {
                 "fm": c.get("fm", ""),
-                "type": "PC+DC 改进",
-                "description": c.get("pc", "") + " | " + c.get("dc", ""),
-                "owner": "____",
-                "due_date": "____",
+                # 措施类型：优先用 Agent 推演的 measure_type，否则根据 pc/dc 推断
+                "type": c.get("measure_type") or (
+                    "PC+DC 改进" if (c.get("pc") and c.get("dc")) else
+                    "PC 改进" if c.get("pc") else
+                    "DC 改进" if c.get("dc") else "PC+DC 改进"
+                ),
+                # 措施描述：优先用 Agent 推演的 measure_desc，否则用 pc+dc 拼接
+                "description": c.get("measure_desc") or (c.get("pc", "") + " | " + c.get("dc", "")),
+                # 责任人：优先用 Agent 推演的 measure_owner
+                "owner": c.get("measure_owner") or "____",
+                # 截止日期：优先用 Agent 推演的 measure_due_date
+                "due_date": c.get("measure_due_date") or "____",
                 "status": "已建议",
+                # 措施后 S/O/D/AP：优先用 Agent 推演的 post_s/post_o/post_d/post_ap
+                "post_s": c.get("post_s") or "—",
+                "post_o": c.get("post_o") or "—",
+                "post_d": c.get("post_d") or "—",
+                "post_ap": c.get("post_ap") or "—",
             }
             for c in chains
             if c.get("ap") in ("H", "M")

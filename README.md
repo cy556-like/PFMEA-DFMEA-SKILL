@@ -124,7 +124,7 @@ def _load_fmea_skill_context(skill: str, user_input: str) -> str:
 
 ## 六、版本
 
-- 当前版本：`2.0.3`（详见 VERSION）
+- 当前版本：`2.0.4`（详见 VERSION）
 - 变更记录：见 CHANGELOG.md
 - 首次发布：2026-06-27
 - 作者：cy556-like（参考 AIAG & VDA 2019 手册整理）
